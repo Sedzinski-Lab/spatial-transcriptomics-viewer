@@ -1,0 +1,685 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ST Viewer (Local, GeoTIFF + Polygons + Per-layer controls, All-transcript ROI counts)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body{margin:0;font-family:system-ui,Segoe UI,Arial;background:#111;color:#eee;display:flex;min-height:100vh}
+  .left{width:360px;background:#1a1a1a;border-right:1px solid #2a2a2a;padding:14px;box-sizing:border-box}
+  .right{flex:1;position:relative}
+  h1{font-size:18px;margin:0 0 10px}
+  .box{border:1px solid #2a2a2a;border-radius:8px;padding:10px;margin-bottom:12px;background:#181818}
+  label{display:block;font-size:12px;color:#bbb;margin:6px 0 4px}
+  input[type=file],select,button,input[type=range]{width:100%}
+  input[type=file]{padding:8px;border-radius:6px;background:#101010;border:1px dashed #333;color:#bbb}
+  select{padding:8px;border-radius:6px;background:#101010;border:1px solid #333;color:#ddd}
+  button{padding:8px;border-radius:6px;background:#4a6cff;border:none;color:white;font-weight:600;cursor:pointer}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  .row{display:flex;gap:8px}
+  .row>*{flex:1}
+  .status{font-size:12px;color:#aaa;margin-top:6px;min-height:16px}
+  .overlayInfo{position:absolute;left:8px;top:8px;background:rgba(0,0,0,.55);padding:4px 8px;border-radius:6px;font-size:12px}
+  canvas{position:absolute;left:0;top:0}
+  /* Gene list with per-layer controls */
+  .genes{max-height:260px;overflow:auto;border:1px solid #2a2a2a;border-radius:6px;margin-top:10px}
+  .geneRow{border-bottom:1px solid #222;padding:8px}
+  .geneRow:last-child{border-bottom:none}
+  .geneHead{display:flex;align-items:center;justify-content:space-between;gap:8px}
+  .geneName{font-weight:600}
+  .geneTools{display:flex;align-items:center;gap:8px}
+  .geneTools input[type=color]{width:28px;height:22px;border:none;background:transparent;cursor:pointer}
+  .geneControls{display:grid;grid-template-columns:auto 1fr auto;gap:6px;align-items:center;margin-top:6px}
+  .muted{color:#aaa;font-size:12px}
+  /* Polygon list */
+  .polys{max-height:200px;overflow:auto;border:1px solid #2a2a2a;border-radius:6px;margin-top:8px}
+  .polyItem{border-bottom:1px solid #222;padding:6px 8px}
+  .polyItem:last-child{border-bottom:none}
+  .polyHead{display:flex;justify-content:space-between;align-items:center;gap:8px}
+  .polyBtns{display:flex;gap:6px}
+</style>
+</head>
+<body>
+  <div class="left">
+    <h1>ST Viewer</h1>
+
+    <div class="box">
+      <label>DAPI image (TIFF/PNG/JPG)</label>
+      <input id="dapiFile" type="file" accept=".tif,.tiff,.png,.jpg,.jpeg">
+      <label style="margin-top:10px">Transcripts (TXT/TSV/CSV)</label>
+      <input id="trFile" type="file" accept=".txt,.tsv,.csv">
+      <div id="status" class="status">Pick files to start…</div>
+    </div>
+
+    <div class="box">
+      <label>Select gene</label>
+      <select id="geneSelect" disabled><option>Load transcripts first</option></select>
+      <button id="addGeneBtn" disabled>Add Gene Layer</button>
+
+      <div class="row" style="margin-top:8px">
+        <div>
+          <label>Default size (new layers)</label>
+          <input id="defaultSize" type="range" min="1" max="25" value="5">
+        </div>
+        <div>
+          <label>Default opacity (new layers)</label>
+          <input id="defaultOpacity" type="range" min="10" max="100" value="80">
+        </div>
+      </div>
+
+      <div class="genes" id="geneList"></div>
+    </div>
+
+    <div class="box">
+      <label>Annotations (polygon ROIs)</label>
+      <div class="row" style="margin-bottom:8px">
+        <button id="drawBtn">✏️ Draw</button>
+        <button id="completeBtn" disabled>✅ Complete</button>
+        <button id="cancelBtn" disabled>⛔ Cancel</button>
+      </div>
+      <div class="row" style="margin-bottom:8px">
+        <button id="exportJsonBtn">Export JSON</button>
+        <button id="exportCsvBtn">Export CSV</button>
+      </div>
+      <div class="polys" id="polyList"></div>
+      <div class="muted" style="margin-top:6px">
+        Click to add vertices · Double-click to finish · Esc to cancel<br>
+        Each ROI can have a <b>cell type</b> label. Counts include <b>all transcripts</b> in the ROI.
+      </div>
+    </div>
+
+    <div class="box">
+      <div class="muted">
+        Tips:<br>
+        • Wheel to zoom · Drag to pan<br>
+        • Auto contrast (2–98%) for 16-bit TIFF
+      </div>
+    </div>
+  </div>
+
+  <div class="right">
+    <div class="overlayInfo" id="info">0 layers</div>
+    <canvas id="dapi"></canvas>
+    <canvas id="points"></canvas>
+    <canvas id="poly"></canvas>
+  </div>
+
+  <!-- GeoTIFF decoder -->
+  <script src="https://cdn.jsdelivr.net/npm/geotiff@2.1.3/dist-browser/geotiff.min.js"></script>
+
+  <script>
+  (function(){
+    const dapiCanvas = document.getElementById('dapi');
+    const ptsCanvas  = document.getElementById('points');
+    const polyCanvas = document.getElementById('poly');
+    const dctx = dapiCanvas.getContext('2d');
+    const pctx = ptsCanvas.getContext('2d');
+    const xctx = polyCanvas.getContext('2d'); // polygons
+    const container = document.querySelector('.right');
+    const info = document.getElementById('info');
+
+    let dapiImg = null;        // HTMLImageElement built from TIFF/PNG/JPG
+    let transcripts = [];      // {x,y,z,gene,score}
+    let genes = [];            // gene list
+    // gene -> {data,color,size,opacity,visible}
+    const layers = new Map();
+
+    // polygons: {id,name,cellType,verts:[{x,y}], total, counts:{}}
+    let polygons = [];
+    let activePoly = null;
+    let drawMode = false;
+    let nextPolyId = 1;
+
+    // defaults for new layers
+    let defaultSize = 5;
+    let defaultOpacity = 0.8;
+
+    // viewport
+    let scale = 1, offX = 0, offY = 0, dragging=false, lastX=0, lastY=0;
+
+    function setStatus(t){ document.getElementById('status').textContent = t; }
+    function resize(){
+      const r = container.getBoundingClientRect();
+      [dapiCanvas, ptsCanvas, polyCanvas].forEach(c=>{
+        c.width = r.width; c.height = r.height; c.style.width = r.width+'px'; c.style.height = r.height+'px';
+      });
+      redraw();
+    }
+    window.addEventListener('resize', resize);
+    window.addEventListener('keydown', (e)=>{
+      if (e.key === 'Escape' && activePoly){
+        activePoly = null; drawMode = false;
+        document.getElementById('drawBtn').textContent='✏️ Draw';
+        document.getElementById('completeBtn').disabled = true;
+        document.getElementById('cancelBtn').disabled = true;
+        redraw();
+      }
+    });
+    resize();
+
+    // ---------- File inputs ----------
+    document.getElementById('dapiFile').addEventListener('change', e=>{
+      const f = e.target.files[0]; if (f) loadDAPI(f);
+    });
+    document.getElementById('trFile').addEventListener('change', e=>{
+      const f = e.target.files[0]; if (f) loadTranscripts(f);
+    });
+
+    // ---------- Defaults for new layers ----------
+    document.getElementById('defaultSize').addEventListener('input', e=>{
+      defaultSize = +e.target.value;
+    });
+    document.getElementById('defaultOpacity').addEventListener('input', e=>{
+      defaultOpacity = +e.target.value / 100;
+    });
+
+    // ---------- Gene UI ----------
+    document.getElementById('addGeneBtn').addEventListener('click', ()=>{
+      const g = document.getElementById('geneSelect').value;
+      if (!g) return;
+      if (layers.has(g)) { setStatus(g+' already added'); return; }
+      const pts = transcripts.filter(r=>r.gene===g);
+      const col = randColor();
+      const layer = {
+        color: col,
+        size: defaultSize,
+        opacity: defaultOpacity,
+        visible: true,
+        data: pts
+      };
+      layers.set(g, layer);
+      addGeneRow(g, layer);
+      redraw();
+      setStatus(`Added ${pts.length} points for ${g}`);
+    });
+
+    function addGeneRow(gene, layer){
+      const list = document.getElementById('geneList');
+      const row = document.createElement('div');
+      row.className='geneRow';
+      row.innerHTML = `
+        <div class="geneHead">
+          <div class="geneName">${gene}</div>
+          <div class="geneTools">
+            <input type="color" value="${layer.color}" title="Color">
+            <button class="toggleBtn" style="padding:4px 8px">${layer.visible?'Hide':'Show'}</button>
+          </div>
+        </div>
+        <div class="geneControls">
+          <span class="muted">Size</span>
+          <input class="sizeRange" type="range" min="1" max="25" value="${layer.size}">
+          <span class="sizeVal">${layer.size}</span>
+
+          <span class="muted">Opacity</span>
+          <input class="opRange" type="range" min="10" max="100" value="${Math.round(layer.opacity*100)}">
+          <span class="opVal">${Math.round(layer.opacity*100)}%</span>
+        </div>
+      `;
+
+      const colorInput = row.querySelector('input[type=color]');
+      const toggleBtn = row.querySelector('.toggleBtn');
+      const sizeRange = row.querySelector('.sizeRange');
+      const opRange = row.querySelector('.opRange');
+      const sizeVal = row.querySelector('.sizeVal');
+      const opVal = row.querySelector('.opVal');
+
+      colorInput.oninput = (e)=>{ layers.get(gene).color = e.target.value; redraw(); };
+      toggleBtn.onclick = ()=>{
+        const L = layers.get(gene);
+        L.visible=!L.visible; toggleBtn.textContent = L.visible?'Hide':'Show';
+        redraw();
+      };
+      sizeRange.oninput = (e)=>{
+        const v = +e.target.value; sizeVal.textContent = v;
+        layers.get(gene).size = v; redraw();
+      };
+      opRange.oninput = (e)=>{
+        const v = +e.target.value; opVal.textContent = v+'%';
+        layers.get(gene).opacity = v/100; redraw();
+      };
+
+      list.appendChild(row);
+    }
+
+    document.getElementById('clearBtn')?.addEventListener('click', ()=>{
+      layers.clear(); document.getElementById('geneList').innerHTML=''; redraw();
+    });
+
+    // ---------- Pan/Zoom & Draw on TOP canvas ----------
+    polyCanvas.addEventListener('mousedown', (e)=>{
+      const rect = polyCanvas.getBoundingClientRect();
+      const x = e.clientX-rect.left, y=e.clientY-rect.top;
+      if (drawMode){
+        const pt = screenToImage(x,y);
+        if (!activePoly) {
+          activePoly = { id: nextPolyId++, name: `ROI ${nextPolyId-1}`, cellType: '', verts: [pt], counts:{}, total:0 };
+        } else {
+          activePoly.verts.push(pt);
+        }
+        redraw();
+        document.getElementById('completeBtn').disabled = (activePoly.verts.length<3);
+        document.getElementById('cancelBtn').disabled = false;
+      } else {
+        dragging=true; lastX=e.clientX; lastY=e.clientY;
+      }
+    });
+    window.addEventListener('mouseup', ()=> dragging=false );
+    window.addEventListener('mousemove', (e)=>{
+      if (!dragging || drawMode) return;
+      offX += (e.clientX-lastX);
+      offY += (e.clientY-lastY);
+      lastX = e.clientX; lastY = e.clientY;
+      redraw();
+    });
+    polyCanvas.addEventListener('wheel', (e)=>{
+      e.preventDefault();
+      if (drawMode) return; // avoid zoom while drawing
+      const rect = polyCanvas.getBoundingClientRect();
+      const x = e.clientX-rect.left, y=e.clientY-rect.top;
+      const k = e.deltaY>0 ? 0.9 : 1.1;
+      zoomAt(x,y,k);
+    }, {passive:false});
+    polyCanvas.addEventListener('dblclick', ()=>{
+      if (drawMode && activePoly && activePoly.verts.length>=3){
+        polygons.push(activePoly);
+        activePoly = null; drawMode=false;
+        document.getElementById('drawBtn').textContent='✏️ Draw';
+        document.getElementById('completeBtn').disabled = true;
+        document.getElementById('cancelBtn').disabled = true;
+        recomputeAllCounts();
+        redraw();
+        renderPolyList();
+      }
+    });
+
+    // Annotation buttons
+    document.getElementById('drawBtn').addEventListener('click', ()=>{
+      drawMode = !drawMode;
+      document.getElementById('drawBtn').textContent = drawMode ? '🛑 Stop' : '✏️ Draw';
+      if (!drawMode){ activePoly=null; document.getElementById('completeBtn').disabled = true; document.getElementById('cancelBtn').disabled = true; redraw(); }
+    });
+    document.getElementById('completeBtn').addEventListener('click', ()=>{
+      if (activePoly && activePoly.verts.length>=3){
+        polygons.push(activePoly);
+        activePoly=null; drawMode=false;
+        document.getElementById('drawBtn').textContent='✏️ Draw';
+        document.getElementById('completeBtn').disabled = true;
+        document.getElementById('cancelBtn').disabled = true;
+        recomputeAllCounts();
+        redraw();
+        renderPolyList();
+      }
+    });
+    document.getElementById('cancelBtn').addEventListener('click', ()=>{
+      activePoly=null; drawMode=false;
+      document.getElementById('drawBtn').textContent='✏️ Draw';
+      document.getElementById('completeBtn').disabled = true;
+      document.getElementById('cancelBtn').disabled = true;
+      redraw();
+    });
+
+    document.getElementById('exportJsonBtn').addEventListener('click', exportPolysJSON);
+    document.getElementById('exportCsvBtn').addEventListener('click', exportCountsCSV);
+
+    // ---------- Rendering ----------
+    function redraw(){
+      // clear
+      dctx.clearRect(0,0,dapiCanvas.width,dapiCanvas.height);
+      pctx.clearRect(0,0,ptsCanvas.width,ptsCanvas.height);
+      xctx.clearRect(0,0,polyCanvas.width,polyCanvas.height);
+
+      // dapi
+      if (dapiImg){
+        dctx.save();
+        dctx.translate(offX, offY);
+        dctx.scale(scale, scale);
+        dctx.drawImage(dapiImg, 0, 0);
+        dctx.restore();
+      }
+
+      // points per layer (per-layer size/opacity/color)
+      pctx.save();
+      pctx.translate(offX, offY);
+      pctx.scale(scale, scale);
+      const s = 1/scale;
+      layers.forEach(L=>{
+        if (!L.visible) return;
+        pctx.globalAlpha = L.opacity;
+        pctx.fillStyle = L.color;
+        const r = L.size*s;
+        for (const p of L.data){
+          pctx.beginPath();
+          pctx.arc(p.x, p.y, r, 0, Math.PI*2);
+          pctx.fill();
+        }
+      });
+      pctx.restore();
+
+      // polygons (overlay)
+      xctx.save();
+      xctx.translate(offX, offY);
+      xctx.scale(scale, scale);
+      xctx.lineWidth = 2/scale;
+
+      for (const poly of polygons){
+        drawPolyShape(xctx, poly.verts, 'rgba(0,255,255,0.18)', '#00e0ff');
+        drawPolyLabel(xctx, poly);
+      }
+      if (activePoly){
+        drawPolyShape(xctx, activePoly.verts, 'rgba(255,255,255,0.12)', '#ffffff', true);
+      }
+      xctx.restore();
+
+      info.textContent = `${[...layers.values()].filter(L=>L.visible).length} visible layer(s) · scale ${scale.toFixed(2)}`;
+    }
+
+    function drawPolyShape(ctx, verts, fill, stroke, open=false){
+      if (!verts.length) return;
+      ctx.beginPath();
+      ctx.moveTo(verts[0].x, verts[0].y);
+      for (let i=1;i<verts.length;i++) ctx.lineTo(verts[i].x, verts[i].y);
+      if (!open && verts.length>=3) ctx.closePath();
+      ctx.strokeStyle = stroke;
+      ctx.fillStyle = fill;
+      if (!open && verts.length>=3) ctx.fill();
+      ctx.stroke();
+
+      // vertices
+      for (const v of verts){
+        ctx.beginPath();
+        ctx.arc(v.x, v.y, 3/scale, 0, Math.PI*2);
+        ctx.fillStyle = stroke;
+        ctx.fill();
+      }
+    }
+
+    function drawPolyLabel(ctx, poly){
+      if (!poly.verts.length) return;
+      let cx=0, cy=0;
+      for (const v of poly.verts){ cx+=v.x; cy+=v.y; }
+      cx/=poly.verts.length; cy/=poly.verts.length;
+      const title = poly.name || `ROI ${poly.id}`;
+      const n = (poly.total != null) ? ` (n=${poly.total})` : '';
+      const label = poly.cellType ? `${title} • ${poly.cellType}${n}` : `${title}${n}`;
+      ctx.font = `${12/scale}px system-ui,Segoe UI,Arial`;
+      ctx.lineWidth = 2/scale;
+      ctx.strokeStyle = 'black';
+      ctx.fillStyle = 'white';
+      ctx.strokeText(label, cx+6/scale, cy-6/scale);
+      ctx.fillText(label,   cx+6/scale, cy-6/scale);
+    }
+
+    // ---------- Geometry / transforms ----------
+    function screenToImage(sx,sy){ return { x:(sx-offX)/scale, y:(sy-offY)/scale }; }
+    function pointInPoly(px,py,verts){
+      let inside=false;
+      for (let i=0,j=verts.length-1;i<verts.length;j=i++){
+        const xi=verts[i].x, yi=verts[i].y, xj=verts[j].x, yj=verts[j].y;
+        const inter = ((yi>py)!==(yj>py)) && (px < ( (xj-xi)*(py-yi) )/(yj-yi) + xi );
+        if (inter) inside=!inside;
+      }
+      return inside;
+    }
+
+    function zoomAt(cx,cy,k){
+      const old = scale;
+      const ns = Math.max(0.1, Math.min(20, old*k));
+      const sc = ns/old;
+      offX = cx - (cx - offX)*sc;
+      offY = cy - (cy - offY)*sc;
+      scale = ns;
+      redraw();
+    }
+
+    function randColor(){
+      const h = Math.floor(Math.random()*360);
+      return `hsl(${h} 90% 60%)`;
+    }
+
+    // ---------- Counts over ALL transcripts ----------
+    function countAllForPoly(poly){
+      const counts = Object.create(null);
+      let total = 0;
+      for (const p of transcripts){
+        if (pointInPoly(p.x, p.y, poly.verts)){
+          total++;
+          counts[p.gene] = (counts[p.gene] || 0) + 1;
+        }
+      }
+      return { total, counts };
+    }
+
+    function recomputeAllCounts(){
+      for (const poly of polygons){
+        const { total, counts } = countAllForPoly(poly);
+        poly.total = total;
+        poly.counts = counts;
+      }
+      renderPolyList();
+    }
+
+    function renderPolyList(){
+      const box = document.getElementById('polyList');
+      box.innerHTML = '';
+      for (const poly of polygons){
+        const total = poly.total ?? 0;
+        const div = document.createElement('div');
+        div.className='polyItem';
+        const ct = poly.cellType ? ` · <span class="muted">type: ${poly.cellType}</span>` : '';
+        div.innerHTML = `
+          <div class="polyHead">
+            <strong>${poly.name||('ROI '+poly.id)}</strong>
+            <div class="polyBtns">
+              <button data-act="setType">Set type</button>
+              <button data-act="rename">Rename</button>
+              <button data-act="delete">Delete</button>
+            </div>
+          </div>
+          <div class="muted">${poly.verts.length} vertices · <b>${total}</b> transcripts${ct}</div>
+          <div style="display:grid;grid-template-columns:1fr auto;gap:4px;margin-top:6px;font-size:12px"></div>
+        `;
+        const grid = div.lastElementChild;
+
+        // Sort genes by count (desc) and show top 30
+        const entries = Object.entries(poly.counts || {}).sort((a,b)=>b[1]-a[1]);
+        const MAX = 30;
+        for (const [g,c] of entries.slice(0, MAX)){
+          const r1 = document.createElement('div'); r1.textContent = g;
+          const r2 = document.createElement('div'); r2.textContent = c; r2.style.textAlign='right';
+          grid.appendChild(r1); grid.appendChild(r2);
+        }
+        if (entries.length > MAX){
+          const more = document.createElement('div');
+          more.className = 'muted';
+          more.style.gridColumn = '1 / -1';
+          more.textContent = `… +${entries.length - MAX} more (see CSV/JSON export)`;
+          grid.appendChild(more);
+        }
+
+        div.querySelector('[data-act=setType]').onclick = ()=>{
+          const nn = prompt('Cell type label for this ROI', poly.cellType || '');
+          if (nn!==null){ poly.cellType = nn.trim(); renderPolyList(); redraw(); }
+        };
+        div.querySelector('[data-act=rename]').onclick = ()=>{
+          const nn = prompt('Name for this ROI', poly.name||('ROI '+poly.id));
+          if (nn) { poly.name = nn; renderPolyList(); redraw(); }
+        };
+        div.querySelector('[data-act=delete]').onclick = ()=>{
+          polygons = polygons.filter(p=>p!==poly);
+          renderPolyList(); redraw();
+        };
+        box.appendChild(div);
+      }
+    }
+
+    function exportPolysJSON(){
+      const payload = {
+        image: dapiImg ? { width: dapiImg.width, height: dapiImg.height } : null,
+        polygons: polygons.map(p=>({
+          id: p.id,
+          name: p.name,
+          cellType: p.cellType || '',
+          vertices: p.verts,
+          total: p.total || 0,
+          counts: p.counts||{}
+        }))
+      };
+      const blob = new Blob([JSON.stringify(payload,null,2)], {type:'application/json'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a'); a.href = url; a.download = 'polygons.json'; a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    function exportCountsCSV(){
+      // rows: poly_id,name,cell_type,total,gene,count
+      const rows = [['poly_id','name','cell_type','total','gene','count']];
+      for (const p of polygons){
+        const nm = p.name || `ROI ${p.id}`;
+        const ct = p.cellType || '';
+        const total = p.total || 0;
+        const entries = Object.entries(p.counts||{}).sort((a,b)=>b[1]-a[1]);
+        if (entries.length === 0){
+          rows.push([p.id, nm, ct, total, '', 0]);
+        } else {
+          for (const [g,c] of entries){
+            rows.push([p.id, nm, ct, total, g, c]);
+          }
+        }
+      }
+      const csv = rows.map(r=>r.join(',')).join('\n');
+      const blob = new Blob([csv], {type:'text/csv'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a'); a.href = url; a.download = 'polygon_counts.csv'; a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    // ---------- Load transcripts ----------
+    async function loadTranscripts(file){
+      try{
+        setStatus('Loading transcripts…');
+        const txt = await file.text();
+        const lines = txt.trim().split(/\r?\n/);
+        const out = [];
+        const G = new Set();
+        for (let i=0;i<lines.length;i++){
+          const row = lines[i].trim();
+          if (!row) continue;
+          const parts = row.split(/[\t,]/);
+          if (parts.length < 4) continue;
+          if (i===0 && isNaN(parseFloat(parts[0]))){ continue; } // header
+          const x = +parts[0], y = +parts[1], z = +(parts[2]||0);
+          const gene = (parts[3]||'').trim();
+          const score = +(parts[4]||1);
+          if (Number.isFinite(x) && Number.isFinite(y) && gene){
+            out.push({x,y,z,gene,score}); G.add(gene);
+          }
+        }
+        transcripts = out;
+        genes = Array.from(G).sort();
+        const sel = document.getElementById('geneSelect');
+        sel.innerHTML = '<option value="">Select a gene…</option>';
+        for (const g of genes){ const o=document.createElement('option'); o.value=g; o.textContent=g; sel.appendChild(o); }
+        sel.disabled = false;
+        document.getElementById('addGeneBtn').disabled = false;
+        setStatus(`Loaded ${out.length} transcripts for ${genes.length} genes`);
+        recomputeAllCounts(); // recompute for any existing polygons
+      }catch(err){
+        console.error(err); setStatus('Failed to load transcripts: '+(err?.message||err));
+      }
+    }
+
+    // ---------- Load DAPI (GeoTIFF/PNG/JPG) ----------
+    async function loadDAPI(file){
+      const name = file.name.toLowerCase();
+      try{
+        if (name.endsWith('.png') || name.endsWith('.jpg') || name.endsWith('.jpeg')){
+          setStatus('Loading image…');
+          const url = URL.createObjectURL(file);
+          const img = new Image();
+          img.onload = ()=>{ URL.revokeObjectURL(url); dapiImg=img; fitView(); redraw(); setStatus(`DAPI ${img.width}×${img.height}`); };
+          img.onerror = ()=>{ URL.revokeObjectURL(url); setStatus('Could not load image'); };
+          img.src = url;
+          return;
+        }
+
+        if (!(name.endsWith('.tif') || name.endsWith('.tiff'))){
+          setStatus('Unsupported image type'); return;
+        }
+
+        setStatus('Decoding TIFF (GeoTIFF)…');
+        const buf = await file.arrayBuffer();
+        const tiff = await GeoTIFF.fromArrayBuffer(buf);
+
+        const count = (await tiff.getImageCount?.()) ?? 1;
+        let image = await tiff.getImage(0);
+        if (count > 1) {
+          let best = image, bestArea = image.getWidth()*image.getHeight();
+          for (let i=1; i<count; i++){
+            const im = await tiff.getImage(i);
+            const area = im.getWidth()*im.getHeight();
+            if (area > bestArea){ best = im; bestArea = area; }
+          }
+          image = best;
+        }
+
+        const w = image.getWidth(), h = image.getHeight();
+        const spp = image.getSamplesPerPixel();
+        const samples = spp >= 3 ? [0,1,2] : [0];
+        const raster = await image.readRasters({ interleave: true, samples });
+
+        const px = w*h;
+        const grayF = new Float32Array(px);
+        if (samples.length === 3) {
+          for (let i=0,j=0; j<px; j++, i+=3) {
+            const r = raster[i], g = raster[i+1], b = raster[i+2];
+            grayF[j] = 0.299*r + 0.587*g + 0.114*b;
+          }
+        } else {
+          for (let j=0; j<px; j++) grayF[j] = raster[j];
+        }
+
+        // Percentile stretch (2–98%)
+        const sorted = Array.from(grayF).sort((a,b)=>a-b);
+        const lo = sorted[Math.floor(sorted.length*0.02)];
+        const hi = sorted[Math.floor(sorted.length*0.98)];
+        const denom = Math.max(1e-6, hi - lo);
+
+        const u8 = new Uint8ClampedArray(px);
+        for (let j=0; j<px; j++){
+          let v = (grayF[j] - lo) * 255 / denom;
+          if (v < 0) v = 0; else if (v > 255) v = 255;
+          u8[j] = v|0;
+        }
+
+        const tmp = document.createElement('canvas'); tmp.width = w; tmp.height = h;
+        const tctx = tmp.getContext('2d', { willReadFrequently:true });
+        const imgData = tctx.createImageData(w, h);
+        for (let i=0, j=0; j<px; j++, i+=4){
+          const v = u8[j];
+          imgData.data[i] = v; imgData.data[i+1] = v; imgData.data[i+2] = v; imgData.data[i+3] = 255;
+        }
+        tctx.putImageData(imgData, 0, 0);
+
+        const img = new Image();
+        img.onload = ()=>{ dapiImg = img; fitView(); redraw(); setStatus(`DAPI ${w}×${h} (GeoTIFF, stretched 2–98%)`); };
+        img.onerror = ()=> setStatus('Could not build image from TIFF');
+        img.src = tmp.toDataURL();
+
+      }catch(err){
+        console.error(err);
+        setStatus('Failed to load DAPI: '+(err?.message||err));
+      }
+    }
+
+    function fitView(){
+      if (!dapiImg){ scale=1; offX=offY=0; return; }
+      const cw = dapiCanvas.width, ch = dapiCanvas.height;
+      const sx = cw / dapiImg.width, sy = ch / dapiImg.height;
+      scale = Math.min(sx, sy) * 0.95;
+      offX = (cw - dapiImg.width * scale)/2;
+      offY = (ch - dapiImg.height * scale)/2;
+    }
+  })();
+  </script>
+</body>
+</html>
