@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>ST Viewer (Local, GeoTIFF + Polygons + Per-layer controls, All-transcript ROI counts)</title>
+<title>ST Viewer (TIFF + Transcripts + ROIs with selection)</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   body{margin:0;font-family:system-ui,Segoe UI,Arial;background:#111;color:#eee;display:flex;min-height:100vh}
@@ -21,7 +21,8 @@
   .status{font-size:12px;color:#aaa;margin-top:6px;min-height:16px}
   .overlayInfo{position:absolute;left:8px;top:8px;background:rgba(0,0,0,.55);padding:4px 8px;border-radius:6px;font-size:12px}
   canvas{position:absolute;left:0;top:0}
-  /* Gene list with per-layer controls */
+
+  /* Gene list */
   .genes{max-height:260px;overflow:auto;border:1px solid #2a2a2a;border-radius:6px;margin-top:10px}
   .geneRow{border-bottom:1px solid #222;padding:8px}
   .geneRow:last-child{border-bottom:none}
@@ -31,10 +32,12 @@
   .geneTools input[type=color]{width:28px;height:22px;border:none;background:transparent;cursor:pointer}
   .geneControls{display:grid;grid-template-columns:auto 1fr auto;gap:6px;align-items:center;margin-top:6px}
   .muted{color:#aaa;font-size:12px}
-  /* Polygon list */
-  .polys{max-height:200px;overflow:auto;border:1px solid #2a2a2a;border-radius:6px;margin-top:8px}
+
+  /* ROI list */
+  .polys{max-height:220px;overflow:auto;border:1px solid #2a2a2a;border-radius:6px;margin-top:8px}
   .polyItem{border-bottom:1px solid #222;padding:6px 8px}
   .polyItem:last-child{border-bottom:none}
+  .polyItem.selected{background:#232323}
   .polyHead{display:flex;justify-content:space-between;align-items:center;gap:8px}
   .polyBtns{display:flex;gap:6px}
 </style>
@@ -73,9 +76,9 @@
     <div class="box">
       <label>Annotations (polygon ROIs)</label>
       <div class="row" style="margin-bottom:8px">
-        <button id="drawBtn">✏️ Draw</button>
-        <button id="completeBtn" disabled>✅ Complete</button>
-        <button id="cancelBtn" disabled>⛔ Cancel</button>
+        <button id="drawBtn">Draw</button>
+        <button id="completeBtn" disabled>Complete</button>
+        <button id="cancelBtn" disabled>Cancel</button>
       </div>
       <div class="row" style="margin-bottom:8px">
         <button id="exportJsonBtn">Export JSON</button>
@@ -83,8 +86,8 @@
       </div>
       <div class="polys" id="polyList"></div>
       <div class="muted" style="margin-top:6px">
-        Click to add vertices · Double-click to finish · Esc to cancel<br>
-        Each ROI can have a <b>cell type</b> label. Counts include <b>all transcripts</b> in the ROI.
+        Click to add vertices. Double-click to finish. Esc to cancel.<br>
+        Click an ROI on the image to select it. Press T to set type, Delete to remove.
       </div>
     </div>
 
@@ -126,7 +129,8 @@
 
     // polygons: {id,name,cellType,verts:[{x,y}], total, counts:{}}
     let polygons = [];
-    let activePoly = null;
+    let activePoly = null;      // when drawing
+    let selectedPolyId = null;  // when selecting
     let drawMode = false;
     let nextPolyId = 1;
 
@@ -147,12 +151,21 @@
     }
     window.addEventListener('resize', resize);
     window.addEventListener('keydown', (e)=>{
+      // cancel drawing
       if (e.key === 'Escape' && activePoly){
         activePoly = null; drawMode = false;
-        document.getElementById('drawBtn').textContent='✏️ Draw';
+        document.getElementById('drawBtn').textContent='Draw';
         document.getElementById('completeBtn').disabled = true;
         document.getElementById('cancelBtn').disabled = true;
         redraw();
+      }
+      // quick set type on selected ROI
+      if ((e.key === 't' || e.key === 'T') && selectedPolyId!=null){
+        setTypeForSelected();
+      }
+      // delete selected ROI
+      if ((e.key === 'Delete' || e.key === 'Backspace') && selectedPolyId!=null){
+        deleteSelectedPoly();
       }
     });
     resize();
@@ -245,7 +258,7 @@
       layers.clear(); document.getElementById('geneList').innerHTML=''; redraw();
     });
 
-    // ---------- Pan/Zoom & Draw on TOP canvas ----------
+    // ---------- Pan/Zoom & Draw & Select on TOP canvas ----------
     polyCanvas.addEventListener('mousedown', (e)=>{
       const rect = polyCanvas.getBoundingClientRect();
       const x = e.clientX-rect.left, y=e.clientY-rect.top;
@@ -260,10 +273,21 @@
         document.getElementById('completeBtn').disabled = (activePoly.verts.length<3);
         document.getElementById('cancelBtn').disabled = false;
       } else {
+        // begin potential pan (we’ll decide on mouseup if it was a click)
         dragging=true; lastX=e.clientX; lastY=e.clientY;
       }
     });
-    window.addEventListener('mouseup', ()=> dragging=false );
+
+    window.addEventListener('mouseup', (e)=>{
+      // if there was no movement, treat as click-select
+      if (dragging && Math.abs(e.clientX-lastX)<2 && Math.abs(e.clientY-lastY)<2 && !drawMode){
+        const rect = polyCanvas.getBoundingClientRect();
+        const x = e.clientX-rect.left, y=e.clientY-rect.top;
+        handleClickSelect(x,y);
+      }
+      dragging=false;
+    });
+
     window.addEventListener('mousemove', (e)=>{
       if (!dragging || drawMode) return;
       offX += (e.clientX-lastX);
@@ -271,6 +295,8 @@
       lastX = e.clientX; lastY = e.clientY;
       redraw();
     });
+
+    // zoom
     polyCanvas.addEventListener('wheel', (e)=>{
       e.preventDefault();
       if (drawMode) return; // avoid zoom while drawing
@@ -279,30 +305,70 @@
       const k = e.deltaY>0 ? 0.9 : 1.1;
       zoomAt(x,y,k);
     }, {passive:false});
-    polyCanvas.addEventListener('dblclick', ()=>{
+
+    // finish drawing on double-click; or if not drawing, double-click ROI to edit type
+    polyCanvas.addEventListener('dblclick', (e)=>{
       if (drawMode && activePoly && activePoly.verts.length>=3){
         polygons.push(activePoly);
         activePoly = null; drawMode=false;
-        document.getElementById('drawBtn').textContent='✏️ Draw';
+        document.getElementById('drawBtn').textContent='Draw';
         document.getElementById('completeBtn').disabled = true;
         document.getElementById('cancelBtn').disabled = true;
         recomputeAllCounts();
         redraw();
         renderPolyList();
+      } else if (!drawMode){
+        const rect = polyCanvas.getBoundingClientRect();
+        const x = e.clientX-rect.left, y=e.clientY-rect.top;
+        const imgPt = screenToImage(x,y);
+        const hit = hitTestPolygons(imgPt.x, imgPt.y);
+        if (hit){
+          selectedPolyId = hit.id;
+          renderPolyList(); redraw();
+          setTypeForSelected();
+        }
       }
     });
+
+    function handleClickSelect(x,y){
+      const imgPt = screenToImage(x,y);
+      const hit = hitTestPolygons(imgPt.x, imgPt.y);
+      if (hit){
+        selectedPolyId = hit.id;
+        renderPolyList(true); // scroll to selected
+        redraw();
+      } else if (selectedPolyId!=null){
+        selectedPolyId = null;
+        renderPolyList();
+        redraw();
+      }
+    }
+
+    function hitTestPolygons(ix,iy){
+      // iterate from top (last) to bottom
+      for (let k=polygons.length-1; k>=0; k--){
+        const poly = polygons[k];
+        if (pointInPoly(ix,iy,poly.verts)) return poly;
+      }
+      return null;
+    }
 
     // Annotation buttons
     document.getElementById('drawBtn').addEventListener('click', ()=>{
       drawMode = !drawMode;
-      document.getElementById('drawBtn').textContent = drawMode ? '🛑 Stop' : '✏️ Draw';
-      if (!drawMode){ activePoly=null; document.getElementById('completeBtn').disabled = true; document.getElementById('cancelBtn').disabled = true; redraw(); }
+      document.getElementById('drawBtn').textContent = drawMode ? 'Stop Drawing' : 'Draw';
+      if (!drawMode){
+        activePoly=null;
+        document.getElementById('completeBtn').disabled = true;
+        document.getElementById('cancelBtn').disabled = true;
+        redraw();
+      }
     });
     document.getElementById('completeBtn').addEventListener('click', ()=>{
       if (activePoly && activePoly.verts.length>=3){
         polygons.push(activePoly);
         activePoly=null; drawMode=false;
-        document.getElementById('drawBtn').textContent='✏️ Draw';
+        document.getElementById('drawBtn').textContent='Draw';
         document.getElementById('completeBtn').disabled = true;
         document.getElementById('cancelBtn').disabled = true;
         recomputeAllCounts();
@@ -312,7 +378,7 @@
     });
     document.getElementById('cancelBtn').addEventListener('click', ()=>{
       activePoly=null; drawMode=false;
-      document.getElementById('drawBtn').textContent='✏️ Draw';
+      document.getElementById('drawBtn').textContent='Draw';
       document.getElementById('completeBtn').disabled = true;
       document.getElementById('cancelBtn').disabled = true;
       redraw();
@@ -337,7 +403,7 @@
         dctx.restore();
       }
 
-      // points per layer (per-layer size/opacity/color)
+      // points per layer
       pctx.save();
       pctx.translate(offX, offY);
       pctx.scale(scale, scale);
@@ -362,18 +428,23 @@
       xctx.lineWidth = 2/scale;
 
       for (const poly of polygons){
-        drawPolyShape(xctx, poly.verts, 'rgba(0,255,255,0.18)', '#00e0ff');
-        drawPolyLabel(xctx, poly);
+        const sel = (poly.id === selectedPolyId);
+        const stroke = sel ? '#ffd54a' : '#00e0ff';
+        const fill = sel ? 'rgba(255,213,74,0.22)' : 'rgba(0,255,255,0.18)';
+        const lw = sel ? 3/scale : 2/scale;
+        drawPolyShape(xctx, poly.verts, fill, stroke, false, lw);
+        drawPolyLabel(xctx, poly, sel);
       }
       if (activePoly){
-        drawPolyShape(xctx, activePoly.verts, 'rgba(255,255,255,0.12)', '#ffffff', true);
+        drawPolyShape(xctx, activePoly.verts, 'rgba(255,255,255,0.12)', '#ffffff', true, 2/scale);
       }
       xctx.restore();
 
-      info.textContent = `${[...layers.values()].filter(L=>L.visible).length} visible layer(s) · scale ${scale.toFixed(2)}`;
+      const selText = selectedPolyId!=null ? ` · ROI ${selectedPolyId} selected` : '';
+      info.textContent = `${[...layers.values()].filter(L=>L.visible).length} visible layer(s) · scale ${scale.toFixed(2)}${selText}`;
     }
 
-    function drawPolyShape(ctx, verts, fill, stroke, open=false){
+    function drawPolyShape(ctx, verts, fill, stroke, open=false, lineW=2){
       if (!verts.length) return;
       ctx.beginPath();
       ctx.moveTo(verts[0].x, verts[0].y);
@@ -381,6 +452,7 @@
       if (!open && verts.length>=3) ctx.closePath();
       ctx.strokeStyle = stroke;
       ctx.fillStyle = fill;
+      ctx.lineWidth = lineW;
       if (!open && verts.length>=3) ctx.fill();
       ctx.stroke();
 
@@ -393,7 +465,7 @@
       }
     }
 
-    function drawPolyLabel(ctx, poly){
+    function drawPolyLabel(ctx, poly, selected){
       if (!poly.verts.length) return;
       let cx=0, cy=0;
       for (const v of poly.verts){ cx+=v.x; cy+=v.y; }
@@ -404,7 +476,7 @@
       ctx.font = `${12/scale}px system-ui,Segoe UI,Arial`;
       ctx.lineWidth = 2/scale;
       ctx.strokeStyle = 'black';
-      ctx.fillStyle = 'white';
+      ctx.fillStyle = selected ? 'yellow' : 'white';
       ctx.strokeText(label, cx+6/scale, cy-6/scale);
       ctx.fillText(label,   cx+6/scale, cy-6/scale);
     }
@@ -458,13 +530,15 @@
       renderPolyList();
     }
 
-    function renderPolyList(){
+    function renderPolyList(scrollToSelected=false){
       const box = document.getElementById('polyList');
       box.innerHTML = '';
       for (const poly of polygons){
         const total = poly.total ?? 0;
         const div = document.createElement('div');
         div.className='polyItem';
+        div.dataset.id = String(poly.id);
+        if (poly.id === selectedPolyId) div.classList.add('selected');
         const ct = poly.cellType ? ` · <span class="muted">type: ${poly.cellType}</span>` : '';
         div.innerHTML = `
           <div class="polyHead">
@@ -492,23 +566,50 @@
           const more = document.createElement('div');
           more.className = 'muted';
           more.style.gridColumn = '1 / -1';
-          more.textContent = `… +${entries.length - MAX} more (see CSV/JSON export)`;
+          more.textContent = `… ${entries.length - MAX} more (see CSV/JSON export)`;
           grid.appendChild(more);
         }
 
         div.querySelector('[data-act=setType]').onclick = ()=>{
-          const nn = prompt('Cell type label for this ROI', poly.cellType || '');
-          if (nn!==null){ poly.cellType = nn.trim(); renderPolyList(); redraw(); }
+          selectedPolyId = poly.id; renderPolyList(); redraw(); setTypeForSelected();
         };
         div.querySelector('[data-act=rename]').onclick = ()=>{
-          const nn = prompt('Name for this ROI', poly.name||('ROI '+poly.id));
+          selectedPolyId = poly.id; const nn = prompt('Name for this ROI', poly.name||('ROI '+poly.id));
           if (nn) { poly.name = nn; renderPolyList(); redraw(); }
         };
         div.querySelector('[data-act=delete]').onclick = ()=>{
           polygons = polygons.filter(p=>p!==poly);
+          if (selectedPolyId === poly.id) selectedPolyId = null;
           renderPolyList(); redraw();
         };
+
+        // clicking a row selects the ROI
+        div.onclick = ()=>{
+          selectedPolyId = poly.id; renderPolyList(); redraw();
+        };
+
         box.appendChild(div);
+      }
+
+      if (scrollToSelected && selectedPolyId!=null){
+        const el = box.querySelector(`.polyItem[data-id="${selectedPolyId}"]`);
+        if (el) el.scrollIntoView({ block:'nearest' });
+      }
+    }
+
+    function setTypeForSelected(){
+      const poly = polygons.find(p=>p.id===selectedPolyId);
+      if (!poly) return;
+      const nn = prompt('Cell type label for this ROI', poly.cellType || '');
+      if (nn!==null){ poly.cellType = nn.trim(); renderPolyList(); redraw(); }
+    }
+
+    function deleteSelectedPoly(){
+      const idx = polygons.findIndex(p=>p.id===selectedPolyId);
+      if (idx>=0){
+        polygons.splice(idx,1);
+        selectedPolyId = null;
+        renderPolyList(); redraw();
       }
     }
 
