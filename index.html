@@ -2,11 +2,11 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>ST Viewer (TIFF + Transcripts + ROIs with selection)</title>
+<title>ST Viewer (TIFF + Transcripts + Mask + Rotation + ROIs)</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   body{margin:0;font-family:system-ui,Segoe UI,Arial;background:#111;color:#eee;display:flex;min-height:100vh}
-  .left{width:360px;background:#1a1a1a;border-right:1px solid #2a2a2a;padding:14px;box-sizing:border-box}
+  .left{width:380px;background:#1a1a1a;border-right:1px solid #2a2a2a;padding:14px;box-sizing:border-box}
   .right{flex:1;position:relative}
   h1{font-size:18px;margin:0 0 10px}
   .box{border:1px solid #2a2a2a;border-radius:8px;padding:10px;margin-bottom:12px;background:#181818}
@@ -20,7 +20,12 @@
   .row>*{flex:1}
   .status{font-size:12px;color:#aaa;margin-top:6px;min-height:16px}
   .overlayInfo{position:absolute;left:8px;top:8px;background:rgba(0,0,0,.55);padding:4px 8px;border-radius:6px;font-size:12px}
+  .overlayControls{position:absolute;right:8px;top:8px;display:flex;gap:8px}
+  .overlayControls button{padding:6px 10px}
   canvas{position:absolute;left:0;top:0}
+  .wide { width: 100%; margin-top: 8px; }
+
+  .muted{color:#aaa;font-size:12px}
 
   /* Gene list */
   .genes{max-height:260px;overflow:auto;border:1px solid #2a2a2a;border-radius:6px;margin-top:10px}
@@ -31,15 +36,17 @@
   .geneTools{display:flex;align-items:center;gap:8px}
   .geneTools input[type=color]{width:28px;height:22px;border:none;background:transparent;cursor:pointer}
   .geneControls{display:grid;grid-template-columns:auto 1fr auto;gap:6px;align-items:center;margin-top:6px}
-  .muted{color:#aaa;font-size:12px}
 
   /* ROI list */
-  .polys{max-height:220px;overflow:auto;border:1px solid #2a2a2a;border-radius:6px;margin-top:8px}
+  .polys{max-height:260px;overflow:auto;border:1px solid #2a2a2a;border-radius:6px;margin-top:8px}
   .polyItem{border-bottom:1px solid #222;padding:6px 8px}
   .polyItem:last-child{border-bottom:none}
   .polyItem.selected{background:#232323}
   .polyHead{display:flex;justify-content:space-between;align-items:center;gap:8px}
   .polyBtns{display:flex;gap:6px}
+
+  /* Mask controls area */
+  .maskRow{display:grid;grid-template-columns:auto 1fr auto;gap:6px;align-items:center}
 </style>
 </head>
 <body>
@@ -49,9 +56,14 @@
     <div class="box">
       <label>DAPI image (TIFF/PNG/JPG)</label>
       <input id="dapiFile" type="file" accept=".tif,.tiff,.png,.jpg,.jpeg">
+
+      <label style="margin-top:10px">Segmentation mask (TIFF/PNG)</label>
+      <input id="maskFile" type="file" accept=".tif,.tiff,.png">
+
       <label style="margin-top:10px">Transcripts (TXT/TSV/CSV)</label>
       <input id="trFile" type="file" accept=".txt,.tsv,.csv">
-      <div id="status" class="status">Pick files to start…</div>
+
+      <div class="status" id="status">Pick files to start…</div>
     </div>
 
     <div class="box">
@@ -74,6 +86,26 @@
     </div>
 
     <div class="box">
+      <label>Mask overlay</label>
+      <div class="row" style="margin-bottom:8px">
+        <label style="display:flex;align-items:center;gap:6px">
+          <input type="checkbox" id="maskShowFill" checked> Show fill
+        </label>
+        <label style="display:flex;align-items:center;gap:6px">
+          <input type="checkbox" id="maskShowEdges" checked> Show edges
+        </label>
+      </div>
+      <div class="maskRow">
+        <span class="muted">Mask opacity</span>
+        <input id="maskOpacity" type="range" min="5" max="100" value="30">
+        <span id="maskOpacityVal">30%</span>
+      </div>
+      <div class="muted" style="margin-top:6px">
+        Mask must be aligned to DAPI and use the same coordinate system.
+      </div>
+    </div>
+
+    <div class="box">
       <label>Annotations (polygon ROIs)</label>
       <div class="row" style="margin-bottom:8px">
         <button id="drawBtn">Draw</button>
@@ -87,71 +119,96 @@
       <div class="polys" id="polyList"></div>
       <div class="muted" style="margin-top:6px">
         Click to add vertices. Double-click to finish. Esc to cancel.<br>
-        Click an ROI on the image to select it. Press T to set type, Delete to remove.
+        Click an ROI on the image to select it. Press T to focus cell-type. Delete to remove.
       </div>
     </div>
 
     <div class="box">
       <div class="muted">
-        Tips:<br>
-        • Wheel to zoom · Drag to pan<br>
-        • Auto contrast (2–98%) for 16-bit TIFF
+        View controls:<br>
+        • Wheel = zoom at cursor · Drag = pan<br>
+        • Hold R + drag = rotate around image center<br>
+        • Reset View fits and sets angle to 0
       </div>
+      <button id="resetViewBtn" class="wide">Reset View</button>
     </div>
   </div>
 
   <div class="right">
     <div class="overlayInfo" id="info">0 layers</div>
     <canvas id="dapi"></canvas>
+    <canvas id="mask"></canvas>
     <canvas id="points"></canvas>
     <canvas id="poly"></canvas>
   </div>
 
-  <!-- GeoTIFF decoder -->
+  <!-- GeoTIFF decoder (for robust TIFF reading) -->
   <script src="https://cdn.jsdelivr.net/npm/geotiff@2.1.3/dist-browser/geotiff.min.js"></script>
 
   <script>
   (function(){
+    // Canvases and contexts
     const dapiCanvas = document.getElementById('dapi');
+    const maskCanvas = document.getElementById('mask');
     const ptsCanvas  = document.getElementById('points');
     const polyCanvas = document.getElementById('poly');
     const dctx = dapiCanvas.getContext('2d');
+    const mctx = maskCanvas.getContext('2d');
     const pctx = ptsCanvas.getContext('2d');
     const xctx = polyCanvas.getContext('2d'); // polygons
     const container = document.querySelector('.right');
     const info = document.getElementById('info');
 
-    let dapiImg = null;        // HTMLImageElement built from TIFF/PNG/JPG
+    // Data
+    let dapiImg = null;        // HTMLImageElement for background
     let transcripts = [];      // {x,y,z,gene,score}
     let genes = [];            // gene list
     // gene -> {data,color,size,opacity,visible}
     const layers = new Map();
 
-    // polygons: {id,name,cellType,verts:[{x,y}], total, counts:{}}
+    // Segmentation mask state
+    let mask = null; // {w,h, labels:Uint32Array, fillBitmap:ImageBitmap, edgeBitmap:ImageBitmap, opacity, showFill, showEdges}
+
+    // ROI state: polygons: {id,name,cellType,verts:[{x,y}], total, counts:{}}
     let polygons = [];
-    let activePoly = null;      // when drawing
-    let selectedPolyId = null;  // when selecting
+    let activePoly = null;
+    let selectedPolyId = null;
     let drawMode = false;
     let nextPolyId = 1;
 
-    // defaults for new layers
+    // Cell-type options (customs will be inserted before "Other…")
+    let cellTypes = ["", "MCC", "Goblet", "IC", "Basal", "SSC", "Other…"];
+
+    // Defaults for new gene layers
     let defaultSize = 5;
     let defaultOpacity = 0.8;
 
-    // viewport
-    let scale = 1, offX = 0, offY = 0, dragging=false, lastX=0, lastY=0;
+    // Viewport (pan/zoom/rotation)
+    let scale = 1, offX = 0, offY = 0;
+    let angle = 0; // radians
+    let pivot = { x: 0, y: 0 }; // rotation pivot in world coords
+    let dragging=false, lastX=0, lastY=0;
+
+    // Rotation interaction
+    let rKey = false;
+    let rotating = false;
+    let rotStartAngle = 0;     // angle at start of drag
+    let rotRefTheta = 0;       // angle from pivot to initial mouse world point
 
     function setStatus(t){ document.getElementById('status').textContent = t; }
+
+    // ---------- Resize ----------
     function resize(){
       const r = container.getBoundingClientRect();
-      [dapiCanvas, ptsCanvas, polyCanvas].forEach(c=>{
+      [dapiCanvas, maskCanvas, ptsCanvas, polyCanvas].forEach(c=>{
         c.width = r.width; c.height = r.height; c.style.width = r.width+'px'; c.style.height = r.height+'px';
       });
       redraw();
     }
     window.addEventListener('resize', resize);
+
+    // ---------- Keyboard ----------
     window.addEventListener('keydown', (e)=>{
-      // cancel drawing
       if (e.key === 'Escape' && activePoly){
         activePoly = null; drawMode = false;
         document.getElementById('drawBtn').textContent='Draw';
@@ -159,31 +216,46 @@
         document.getElementById('cancelBtn').disabled = true;
         redraw();
       }
-      // quick set type on selected ROI
       if ((e.key === 't' || e.key === 'T') && selectedPolyId!=null){
-        setTypeForSelected();
+        focusCellTypeSelector(selectedPolyId);
       }
-      // delete selected ROI
       if ((e.key === 'Delete' || e.key === 'Backspace') && selectedPolyId!=null){
         deleteSelectedPoly();
       }
+      if (e.key === 'r' || e.key === 'R') {
+        rKey = true;
+      }
     });
-    resize();
+    window.addEventListener('keyup', (e)=>{
+      if (e.key === 'r' || e.key === 'R') {
+        rKey = false;
+        rotating = false;
+      }
+    });
 
     // ---------- File inputs ----------
     document.getElementById('dapiFile').addEventListener('change', e=>{
       const f = e.target.files[0]; if (f) loadDAPI(f);
     });
+    document.getElementById('maskFile').addEventListener('change', e=>{
+      const f = e.target.files[0]; if (f) loadMask(f);
+    });
     document.getElementById('trFile').addEventListener('change', e=>{
       const f = e.target.files[0]; if (f) loadTranscripts(f);
     });
 
-    // ---------- Defaults for new layers ----------
-    document.getElementById('defaultSize').addEventListener('input', e=>{
-      defaultSize = +e.target.value;
-    });
-    document.getElementById('defaultOpacity').addEventListener('input', e=>{
-      defaultOpacity = +e.target.value / 100;
+    // ---------- Mask overlay UI ----------
+    const maskShowFillEl = document.getElementById('maskShowFill');
+    const maskShowEdgesEl = document.getElementById('maskShowEdges');
+    const maskOpacityEl = document.getElementById('maskOpacity');
+    const maskOpacityValEl = document.getElementById('maskOpacityVal');
+
+    maskShowFillEl.addEventListener('change', ()=>{ if (mask){ mask.showFill = maskShowFillEl.checked; redraw(); } });
+    maskShowEdgesEl.addEventListener('change', ()=>{ if (mask){ mask.showEdges = maskShowEdgesEl.checked; redraw(); } });
+    maskOpacityEl.addEventListener('input', ()=>{
+      const v = (+maskOpacityEl.value)/100;
+      maskOpacityValEl.textContent = maskOpacityEl.value + '%';
+      if (mask){ mask.opacity = v; redraw(); }
     });
 
     // ---------- Gene UI ----------
@@ -254,16 +326,29 @@
       list.appendChild(row);
     }
 
-    document.getElementById('clearBtn')?.addEventListener('click', ()=>{
-      layers.clear(); document.getElementById('geneList').innerHTML=''; redraw();
+    document.getElementById('defaultSize').addEventListener('input', e=>{
+      defaultSize = +e.target.value;
+    });
+    document.getElementById('defaultOpacity').addEventListener('input', e=>{
+      defaultOpacity = +e.target.value / 100;
     });
 
-    // ---------- Pan/Zoom & Draw & Select on TOP canvas ----------
+    // ---------- Pan/Zoom/Rotate & Draw & Select on TOP canvas ----------
     polyCanvas.addEventListener('mousedown', (e)=>{
       const rect = polyCanvas.getBoundingClientRect();
       const x = e.clientX-rect.left, y=e.clientY-rect.top;
+      if (rKey){
+        // Start rotation around image center
+        rotating = true;
+        setPivotToImageCenter();
+        const ptW = screenToWorld(x,y);
+        rotRefTheta = Math.atan2(ptW.y - pivot.y, ptW.x - pivot.x);
+        rotStartAngle = angle;
+        return;
+      }
+
       if (drawMode){
-        const pt = screenToImage(x,y);
+        const pt = screenToWorld(x,y);
         if (!activePoly) {
           activePoly = { id: nextPolyId++, name: `ROI ${nextPolyId-1}`, cellType: '', verts: [pt], counts:{}, total:0 };
         } else {
@@ -273,13 +358,14 @@
         document.getElementById('completeBtn').disabled = (activePoly.verts.length<3);
         document.getElementById('cancelBtn').disabled = false;
       } else {
-        // begin potential pan (we’ll decide on mouseup if it was a click)
+        // begin pan
         dragging=true; lastX=e.clientX; lastY=e.clientY;
       }
     });
 
     window.addEventListener('mouseup', (e)=>{
-      // if there was no movement, treat as click-select
+      if (rotating){ rotating=false; return; }
+      // if minimal movement, treat as click-select
       if (dragging && Math.abs(e.clientX-lastX)<2 && Math.abs(e.clientY-lastY)<2 && !drawMode){
         const rect = polyCanvas.getBoundingClientRect();
         const x = e.clientX-rect.left, y=e.clientY-rect.top;
@@ -289,6 +375,15 @@
     });
 
     window.addEventListener('mousemove', (e)=>{
+      if (rotating){
+        const rect = polyCanvas.getBoundingClientRect();
+        const x = e.clientX-rect.left, y=e.clientY-rect.top;
+        const ptW = screenToWorld(x,y);
+        const theta = Math.atan2(ptW.y - pivot.y, ptW.x - pivot.x);
+        angle = rotStartAngle + (theta - rotRefTheta);
+        redraw();
+        return;
+      }
       if (!dragging || drawMode) return;
       offX += (e.clientX-lastX);
       offY += (e.clientY-lastY);
@@ -296,17 +391,17 @@
       redraw();
     });
 
-    // zoom
+    // zoom at cursor keeping world point fixed
     polyCanvas.addEventListener('wheel', (e)=>{
       e.preventDefault();
-      if (drawMode) return; // avoid zoom while drawing
+      if (drawMode) return;
       const rect = polyCanvas.getBoundingClientRect();
-      const x = e.clientX-rect.left, y=e.clientY-rect.top;
+      const cx = e.clientX-rect.left, cy=e.clientY-rect.top;
       const k = e.deltaY>0 ? 0.9 : 1.1;
-      zoomAt(x,y,k);
+      zoomAt(cx,cy,k);
     }, {passive:false});
 
-    // finish drawing on double-click; or if not drawing, double-click ROI to edit type
+    // finish drawing on double-click; or if not drawing, double-click ROI to focus its selector
     polyCanvas.addEventListener('dblclick', (e)=>{
       if (drawMode && activePoly && activePoly.verts.length>=3){
         polygons.push(activePoly);
@@ -320,22 +415,29 @@
       } else if (!drawMode){
         const rect = polyCanvas.getBoundingClientRect();
         const x = e.clientX-rect.left, y=e.clientY-rect.top;
-        const imgPt = screenToImage(x,y);
+        const imgPt = screenToWorld(x,y);
         const hit = hitTestPolygons(imgPt.x, imgPt.y);
         if (hit){
           selectedPolyId = hit.id;
           renderPolyList(); redraw();
-          setTypeForSelected();
+          focusCellTypeSelector(selectedPolyId);
         }
       }
     });
 
+    // Reset view
+    document.getElementById('resetViewBtn').addEventListener('click', ()=>{
+      fitView(true);
+      redraw();
+    });
+
+
     function handleClickSelect(x,y){
-      const imgPt = screenToImage(x,y);
+      const imgPt = screenToWorld(x,y);
       const hit = hitTestPolygons(imgPt.x, imgPt.y);
       if (hit){
         selectedPolyId = hit.id;
-        renderPolyList(true); // scroll to selected
+        renderPolyList(true);
         redraw();
       } else if (selectedPolyId!=null){
         selectedPolyId = null;
@@ -345,7 +447,6 @@
     }
 
     function hitTestPolygons(ix,iy){
-      // iterate from top (last) to bottom
       for (let k=polygons.length-1; k>=0; k--){
         const poly = polygons[k];
         if (pointInPoly(ix,iy,poly.verts)) return poly;
@@ -389,44 +490,53 @@
 
     // ---------- Rendering ----------
     function redraw(){
-      // clear
+      // clear all
+      [dctx, mctx, pctx, xctx].forEach(ctx=>ctx.setTransform(1,0,0,1,0,0));
       dctx.clearRect(0,0,dapiCanvas.width,dapiCanvas.height);
+      mctx.clearRect(0,0,maskCanvas.width,maskCanvas.height);
       pctx.clearRect(0,0,ptsCanvas.width,ptsCanvas.height);
       xctx.clearRect(0,0,polyCanvas.width,polyCanvas.height);
 
-      // dapi
+      // DAPI
       if (dapiImg){
-        dctx.save();
-        dctx.translate(offX, offY);
-        dctx.scale(scale, scale);
+        applyView(dctx);
         dctx.drawImage(dapiImg, 0, 0);
-        dctx.restore();
+        dctx.setTransform(1,0,0,1,0,0);
       }
 
-      // points per layer
-      pctx.save();
-      pctx.translate(offX, offY);
-      pctx.scale(scale, scale);
+      // Mask
+      if (mask){
+        applyView(mctx);
+        if (mask.showFill && mask.fillBitmap){
+          mctx.globalAlpha = mask.opacity ?? 0.3;
+          mctx.drawImage(mask.fillBitmap, 0, 0);
+        }
+        if (mask.showEdges && mask.edgeBitmap){
+          mctx.globalAlpha = 1;
+          mctx.drawImage(mask.edgeBitmap, 0, 0);
+        }
+        mctx.setTransform(1,0,0,1,0,0);
+      }
+
+      // Points per gene layer
+      applyView(pctx);
       const s = 1/scale;
       layers.forEach(L=>{
         if (!L.visible) return;
         pctx.globalAlpha = L.opacity;
         pctx.fillStyle = L.color;
         const r = L.size*s;
-        for (const p of L.data){
+        for (const pt of L.data){
           pctx.beginPath();
-          pctx.arc(p.x, p.y, r, 0, Math.PI*2);
+          pctx.arc(pt.x, pt.y, r, 0, Math.PI*2);
           pctx.fill();
         }
       });
-      pctx.restore();
+      pctx.setTransform(1,0,0,1,0,0);
 
-      // polygons (overlay)
-      xctx.save();
-      xctx.translate(offX, offY);
-      xctx.scale(scale, scale);
+      // Polygons overlay
+      applyView(xctx);
       xctx.lineWidth = 2/scale;
-
       for (const poly of polygons){
         const sel = (poly.id === selectedPolyId);
         const stroke = sel ? '#ffd54a' : '#00e0ff';
@@ -438,10 +548,52 @@
       if (activePoly){
         drawPolyShape(xctx, activePoly.verts, 'rgba(255,255,255,0.12)', '#ffffff', true, 2/scale);
       }
-      xctx.restore();
+      xctx.setTransform(1,0,0,1,0,0);
 
       const selText = selectedPolyId!=null ? ` · ROI ${selectedPolyId} selected` : '';
-      info.textContent = `${[...layers.values()].filter(L=>L.visible).length} visible layer(s) · scale ${scale.toFixed(2)}${selText}`;
+      const deg = (angle*180/Math.PI).toFixed(1);
+      info.textContent = `${[...layers.values()].filter(L=>L.visible).length} visible layer(s) · scale ${scale.toFixed(2)} · angle ${deg}°${selText}`;
+    }
+
+    function applyView(ctx){
+      // screen = T(off) * S(scale) * T(pivot) * R(angle) * T(-pivot) * world
+      ctx.setTransform(1,0,0,1,0,0);
+      ctx.translate(offX, offY);
+      ctx.scale(scale, scale);
+      ctx.translate(pivot.x, pivot.y);
+      ctx.rotate(angle);
+      ctx.translate(-pivot.x, -pivot.y);
+    }
+
+    function worldToScreen(wx, wy){
+      // For zoomAt helper
+      let x = wx, y = wy;
+      // translate -pivot
+      x -= pivot.x; y -= pivot.y;
+      // rotate
+      const ca = Math.cos(angle), sa = Math.sin(angle);
+      const xr =  ca*x - sa*y;
+      const yr =  sa*x + ca*y;
+      // translate +pivot
+      x = xr + pivot.x; y = yr + pivot.y;
+      // scale and offset
+      const sx = offX + x*scale;
+      const sy = offY + y*scale;
+      return { x: sx, y: sy };
+    }
+
+    function screenToWorld(sx,sy){
+      // Inverse of T(off) * S(scale) * T(piv) * R(angle) * T(-piv)
+      let x = sx - offX, y = sy - offY; // remove offset
+      x /= scale; y /= scale;           // undo scale
+      x -= pivot.x; y -= pivot.y;       // undo +pivot
+      // undo rotation
+      const ca = Math.cos(-angle), sa = Math.sin(-angle);
+      const xr = ca*x - sa*y;
+      const yr = sa*x + ca*y;
+      // undo -pivot
+      x = xr + pivot.x; y = yr + pivot.y;
+      return { x, y };
     }
 
     function drawPolyShape(ctx, verts, fill, stroke, open=false, lineW=2){
@@ -481,25 +633,25 @@
       ctx.fillText(label,   cx+6/scale, cy-6/scale);
     }
 
-    // ---------- Geometry / transforms ----------
-    function screenToImage(sx,sy){ return { x:(sx-offX)/scale, y:(sy-offY)/scale }; }
+    // ---------- Geometry / helpers ----------
     function pointInPoly(px,py,verts){
       let inside=false;
       for (let i=0,j=verts.length-1;i<verts.length;j=i++){
         const xi=verts[i].x, yi=verts[i].y, xj=verts[j].x, yj=verts[j].y;
-        const inter = ((yi>py)!==(yj>py)) && (px < ( (xj-xi)*(py-yi) )/(yj-yi) + xi );
+        const inter = ((yi>py)!==(yj>py)) && (px < ((xj-xi)*(py-yi))/(yj-yi) + xi);
         if (inter) inside=!inside;
       }
       return inside;
     }
 
     function zoomAt(cx,cy,k){
-      const old = scale;
-      const ns = Math.max(0.1, Math.min(20, old*k));
-      const sc = ns/old;
-      offX = cx - (cx - offX)*sc;
-      offY = cy - (cy - offY)*sc;
+      const worldBefore = screenToWorld(cx,cy);
+      const ns = Math.max(0.1, Math.min(20, scale*k));
       scale = ns;
+      // adjust offset so worldBefore stays under cursor
+      const screenAfter = worldToScreen(worldBefore.x, worldBefore.y);
+      offX += (cx - screenAfter.x);
+      offY += (cy - screenAfter.y);
       redraw();
     }
 
@@ -530,6 +682,18 @@
       renderPolyList();
     }
 
+    function focusCellTypeSelector(polyId){
+      const box = document.getElementById('polyList');
+      const row = box ? box.querySelector(`.polyItem[data-id="${polyId}"]`) : null;
+      if (row){
+        const sel = row.querySelector('.cellTypeSel');
+        if (sel){
+          row.scrollIntoView({ block:'nearest' });
+          sel.focus();
+        }
+      }
+    }
+
     function renderPolyList(scrollToSelected=false){
       const box = document.getElementById('polyList');
       box.innerHTML = '';
@@ -539,22 +703,66 @@
         div.className='polyItem';
         div.dataset.id = String(poly.id);
         if (poly.id === selectedPolyId) div.classList.add('selected');
-        const ct = poly.cellType ? ` · <span class="muted">type: ${poly.cellType}</span>` : '';
+
+        const ctInfo = poly.cellType ? ` · <span class="muted">type: ${poly.cellType}</span>` : '';
+
         div.innerHTML = `
           <div class="polyHead">
             <strong>${poly.name||('ROI '+poly.id)}</strong>
             <div class="polyBtns">
-              <button data-act="setType">Set type</button>
               <button data-act="rename">Rename</button>
               <button data-act="delete">Delete</button>
             </div>
           </div>
-          <div class="muted">${poly.verts.length} vertices · <b>${total}</b> transcripts${ct}</div>
-          <div style="display:grid;grid-template-columns:1fr auto;gap:4px;margin-top:6px;font-size:12px"></div>
-        `;
-        const grid = div.lastElementChild;
 
-        // Sort genes by count (desc) and show top 30
+          <div class="maskRow" style="margin:6px 0 4px">
+            <span class="muted">Cell type</span>
+            <select class="cellTypeSel"></select>
+            <span class="muted">${poly.verts.length}v · <b>${total}</b> tx</span>
+          </div>
+
+          <div class="muted">${ctInfo}</div>
+
+          <div class="countsGrid" style="display:grid;grid-template-columns:1fr auto;gap:4px;margin-top:6px;font-size:12px"></div>
+        `;
+
+        // Build options (include current poly.cellType if it’s not in the predefined list)
+        const sel = div.querySelector('.cellTypeSel');
+        const hasCurrent = (poly.cellType ?? "") && !cellTypes.includes(poly.cellType);
+        const opts = (hasCurrent ? [poly.cellType] : []).concat(cellTypes);
+
+        sel.innerHTML = opts.map(ct => {
+          const value = (ct === "Other…") ? "__other__" : ct;
+          const label = ct === "" ? "(unset)" : ct;
+          const selected = (poly.cellType || "") === ct ? ' selected' : '';
+          return `<option value="${value}"${selected}>${label}</option>`;
+        }).join("");
+
+        sel.onchange = (e) => {
+          const v = e.target.value;
+          if (v === "__other__") {
+            const nn = prompt("Enter custom cell type:", "");
+            if (nn && nn.trim()) {
+              const name = nn.trim();
+              if (!cellTypes.includes(name)) {
+                const idx = Math.max(0, cellTypes.indexOf("Other…"));
+                cellTypes.splice(idx, 0, name);
+              }
+              poly.cellType = name;
+              renderPolyList(); // refresh row so the new option appears selected
+              redraw();
+            } else {
+              renderPolyList(); // revert UI
+            }
+          } else {
+            poly.cellType = v; // may be "" for unset or any preset
+            renderPolyList();
+            redraw();
+          }
+        };
+
+        // Counts grid (top 30)
+        const grid = div.querySelector('.countsGrid');
         const entries = Object.entries(poly.counts || {}).sort((a,b)=>b[1]-a[1]);
         const MAX = 30;
         for (const [g,c] of entries.slice(0, MAX)){
@@ -570,9 +778,6 @@
           grid.appendChild(more);
         }
 
-        div.querySelector('[data-act=setType]').onclick = ()=>{
-          selectedPolyId = poly.id; renderPolyList(); redraw(); setTypeForSelected();
-        };
         div.querySelector('[data-act=rename]').onclick = ()=>{
           selectedPolyId = poly.id; const nn = prompt('Name for this ROI', poly.name||('ROI '+poly.id));
           if (nn) { poly.name = nn; renderPolyList(); redraw(); }
@@ -595,13 +800,6 @@
         const el = box.querySelector(`.polyItem[data-id="${selectedPolyId}"]`);
         if (el) el.scrollIntoView({ block:'nearest' });
       }
-    }
-
-    function setTypeForSelected(){
-      const poly = polygons.find(p=>p.id===selectedPolyId);
-      if (!poly) return;
-      const nn = prompt('Cell type label for this ROI', poly.cellType || '');
-      if (nn!==null){ poly.cellType = nn.trim(); renderPolyList(); redraw(); }
     }
 
     function deleteSelectedPoly(){
@@ -632,7 +830,6 @@
     }
 
     function exportCountsCSV(){
-      // rows: poly_id,name,cell_type,total,gene,count
       const rows = [['poly_id','name','cell_type','total','gene','count']];
       for (const p of polygons){
         const nm = p.name || `ROI ${p.id}`;
@@ -683,7 +880,7 @@
         sel.disabled = false;
         document.getElementById('addGeneBtn').disabled = false;
         setStatus(`Loaded ${out.length} transcripts for ${genes.length} genes`);
-        recomputeAllCounts(); // recompute for any existing polygons
+        recomputeAllCounts();
       }catch(err){
         console.error(err); setStatus('Failed to load transcripts: '+(err?.message||err));
       }
@@ -697,7 +894,10 @@
           setStatus('Loading image…');
           const url = URL.createObjectURL(file);
           const img = new Image();
-          img.onload = ()=>{ URL.revokeObjectURL(url); dapiImg=img; fitView(); redraw(); setStatus(`DAPI ${img.width}×${img.height}`); };
+          img.onload = ()=>{
+            URL.revokeObjectURL(url);
+            dapiImg=img; fitView(true); redraw(); setStatus(`DAPI ${img.width}×${img.height}`);
+          };
           img.onerror = ()=>{ URL.revokeObjectURL(url); setStatus('Could not load image'); };
           img.src = url;
           return;
@@ -762,7 +962,7 @@
         tctx.putImageData(imgData, 0, 0);
 
         const img = new Image();
-        img.onload = ()=>{ dapiImg = img; fitView(); redraw(); setStatus(`DAPI ${w}×${h} (GeoTIFF, stretched 2–98%)`); };
+        img.onload = ()=>{ dapiImg = img; fitView(true); redraw(); setStatus(`DAPI ${w}×${h} (GeoTIFF, stretched 2–98%)`); };
         img.onerror = ()=> setStatus('Could not build image from TIFF');
         img.src = tmp.toDataURL();
 
@@ -772,14 +972,229 @@
       }
     }
 
-    function fitView(){
-      if (!dapiImg){ scale=1; offX=offY=0; return; }
-      const cw = dapiCanvas.width, ch = dapiCanvas.height;
-      const sx = cw / dapiImg.width, sy = ch / dapiImg.height;
-      scale = Math.min(sx, sy) * 0.95;
-      offX = (cw - dapiImg.width * scale)/2;
-      offY = (ch - dapiImg.height * scale)/2;
+    // ---------- Load Segmentation Mask (TIFF/PNG) ----------
+    async function loadMask(file){
+      try{
+        setStatus('Loading segmentation mask…');
+        const name = file.name.toLowerCase();
+        let w=0, h=0, labels=null;
+
+        if (name.endsWith('.tif') || name.endsWith('.tiff')){
+          const buf = await file.arrayBuffer();
+          const tiff = await GeoTIFF.fromArrayBuffer(buf);
+          const count = (await tiff.getImageCount?.()) ?? 1;
+          let image = await tiff.getImage(0);
+          if (count > 1) {
+            let best = image, bestArea = image.getWidth()*image.getHeight();
+            for (let i=1; i<count; i++){
+              const im = await tiff.getImage(i);
+              const area = im.getWidth()*im.getHeight();
+              if (area > bestArea){ best = im; bestArea = area; }
+            }
+            image = best;
+          }
+          w = image.getWidth(); h = image.getHeight();
+          const spp = image.getSamplesPerPixel();
+
+          if (spp === 1){
+            const ras = await image.readRasters({ interleave:true });
+            labels = new Uint32Array(ras.length);
+            for (let i=0;i<ras.length;i++) labels[i] = ras[i] >>> 0;
+          } else {
+            const ras = await image.readRasters({ interleave:true, samples:[0,1,2] });
+            labels = colorToLabelsFromInterleavedRGB(ras, w, h);
+          }
+        } else if (name.endsWith('.png')){
+          const url = URL.createObjectURL(file);
+          const img = new Image();
+          await new Promise((res,rej)=>{ img.onload=res; img.onerror=rej; img.src=url; });
+          URL.revokeObjectURL(url);
+          w = img.width; h = img.height;
+          const tmp = document.createElement('canvas'); tmp.width=w; tmp.height=h;
+          const tctx = tmp.getContext('2d', { willReadFrequently:true });
+          tctx.drawImage(img,0,0);
+          const id = tctx.getImageData(0,0,w,h).data;
+          let grayscale = true;
+          for (let i=0;i<id.length;i+=4){
+            if (id[i]!==id[i+1] || id[i]!==id[i+2]){ grayscale=false; break; }
+          }
+          if (grayscale){
+            labels = new Uint32Array(w*h);
+            for (let j=0,i=0;j<w*h;j++,i+=4) labels[j] = id[i];
+          } else {
+            const rgb = new Uint8Array(w*h*3);
+            for (let j=0,i=0,k=0;j<w*h;j++,i+=4,k+=3){ rgb[k]=id[i]; rgb[k+1]=id[i+1]; rgb[k+2]=id[i+2]; }
+            labels = colorToLabelsFromInterleavedRGB(rgb, w, h);
+          }
+        } else {
+          setStatus('Unsupported mask type. Use TIFF or PNG.');
+          return;
+        }
+
+        const { fillBitmap, edgeBitmap } = await buildMaskBitmaps(labels, w, h);
+
+        mask = {
+          w, h, labels,
+          fillBitmap, edgeBitmap,
+          opacity: (+maskOpacityEl.value)/100,
+          showFill: maskShowFillEl.checked,
+          showEdges: maskShowEdgesEl.checked
+        };
+        if (!dapiImg) setPivotToImageCenter();
+        setStatus(`Mask loaded ${w}×${h}`);
+        redraw();
+      } catch(err){
+        console.error(err);
+        setStatus('Failed to load mask: '+(err?.message||err));
+      }
     }
+
+    function colorToLabelsFromInterleavedRGB(rgb, w, h){
+      const N = w*h;
+      const labels = new Uint32Array(N);
+      const map = new Map(); // color->label
+      let next = 1;
+      for (let j=0,k=0;j<N;j++,k+=3){
+        const key = (rgb[k]<<16) | (rgb[k+1]<<8) | (rgb[k+2]);
+        if (key === 0){ labels[j]=0; continue; } // treat black as background
+        let lab = map.get(key);
+        if (!lab){ lab = next++; map.set(key, lab); }
+        labels[j] = lab;
+      }
+      return labels;
+    }
+
+    async function buildMaskBitmaps(labels, w, h){
+      function labelColor(l){
+        const h = (l * 137.508) % 360;
+        const s = 70, L = 55;
+        return hslToRgb(h/360, s/100, L/100); // [r,g,b]
+      }
+
+      // Fill bitmap
+      const c1 = document.createElement('canvas'); c1.width=w; c1.height=h;
+      const g1 = c1.getContext('2d', { willReadFrequently:true });
+      const id1 = g1.createImageData(w,h);
+      for (let j=0,i=0;j<w*h;j++,i+=4){
+        const lab = labels[j];
+        if (lab===0){ id1.data[i+3]=0; continue; }
+        const [r,g,b] = labelColor(lab);
+        id1.data[i]=r; id1.data[i+1]=g; id1.data[i+2]=b; id1.data[i+3]=255;
+      }
+      g1.putImageData(id1,0,0);
+      const fillBitmap = await createImageBitmap(c1);
+
+      // Edge bitmap (simple 4-neighbor boundary)
+      const c2 = document.createElement('canvas'); c2.width=w; c2.height=h;
+      const g2 = c2.getContext('2d', { willReadFrequently:true });
+      const id2 = g2.createImageData(w,h);
+      for (let y=0;y<h;y++){
+        for (let x=0;x<w;x++){
+          const idx = y*w + x;
+          const lab = labels[idx];
+          if (lab===0) continue;
+          let edge=false;
+          if (x+1<w && labels[idx+1]!==lab) edge=true;
+          else if (y+1<h && labels[idx+w]!==lab) edge=true;
+          else if (x>0 && labels[idx-1]!==lab) edge=true;
+          else if (y>0 && labels[idx-w]!==lab) edge=true;
+          if (edge){
+            const i = idx*4;
+            id2.data[i]=255; id2.data[i+1]=255; id2.data[i+2]=255; id2.data[i+3]=255;
+          }
+        }
+      }
+      g2.putImageData(id2,0,0);
+      const edgeBitmap = await createImageBitmap(c2);
+
+      return { fillBitmap, edgeBitmap };
+    }
+
+    function hslToRgb(h, s, l){
+      if (s===0) { const v = Math.round(l*255); return [v,v,v]; }
+      const q = l < 0.5 ? l*(1+s) : l + s - l*s;
+      const p = 2*l - q;
+      const r = hue2rgb(p,q,h+1/3);
+      const g = hue2rgb(p,q,h);
+      const b = hue2rgb(p,q,h-1/3);
+      return [Math.round(r*255), Math.round(g*255), Math.round(b*255)];
+    }
+    function hue2rgb(p,q,t){
+      if (t<0) t+=1; if (t>1) t-=1;
+      if (t<1/6) return p + (q-p)*6*t;
+      if (t<1/2) return q;
+      if (t<2/3) return p + (q-p)*(2/3 - t)*6;
+      return p;
+    }
+
+    // ---------- Fit / Reset ----------
+    function ensureCanvasSize(){
+      // Make sure canvases actually match the visible container size
+      const r = container.getBoundingClientRect();
+      [dapiCanvas, maskCanvas, ptsCanvas, polyCanvas].forEach(c=>{
+        if (c.width !== r.width || c.height !== r.height){
+          c.width  = r.width;
+          c.height = r.height;
+          c.style.width  = r.width+'px';
+          c.style.height = r.height+'px';
+        }
+      });
+    }
+    function fitView(resetAngle=false){
+      // Ensure we have current canvas dimensions
+      ensureCanvasSize();
+
+      // If no image yet, just zero the transform we control
+      if (!dapiImg){
+        scale = 1; offX = 0; offY = 0;
+        if (resetAngle) angle = 0;
+        // If a mask exists, still define a sensible pivot (its center)
+        if (mask){
+          pivot.x = mask.w/2; pivot.y = mask.h/2;
+        }
+        return;
+      }
+
+      // Fit the (unrotated) image into the canvas
+      const cw = dapiCanvas.width, ch = dapiCanvas.height;
+      const iw = dapiImg.width,    ih = dapiImg.height;
+
+      // Reset angle first so math is consistent
+      if (resetAngle) angle = 0;
+
+      const sx = cw / iw, sy = ch / ih;
+      scale = Math.min(sx, sy) * 0.95;
+
+      const drawW = iw * scale, drawH = ih * scale;
+      offX = Math.round((cw - drawW)/2);
+      offY = Math.round((ch - drawH)/2);
+
+      // Always rotate around the image center
+      pivot.x = iw/2;
+      pivot.y = ih/2;
+
+      // (Optional) quick trace for debugging
+      console.log(`[Reset] cw×ch=${cw}×${ch} | img=${iw}×${ih} | scale=${scale.toFixed(3)} | off=(${offX},${offY}) | angle=${(angle*180/Math.PI).toFixed(1)}°`);
+    }
+
+    function setPivotToImageCenter(){
+      if (dapiImg){
+        pivot.x = dapiImg.width  / 2;
+        pivot.y = dapiImg.height / 2;
+      } else if (mask){
+        pivot.x = mask.w / 2;
+        pivot.y = mask.h / 2;
+      } else {
+        const wx0 = (-offX) / scale, wy0 = (-offY) / scale;
+        const wx1 = (polyCanvas.width  - offX) / scale;
+        const wy1 = (polyCanvas.height - offY) / scale;
+        pivot.x = (wx0 + wx1) / 2;
+        pivot.y = (wy0 + wy1) / 2;
+      }
+    }
+
+    // ---------- Init ----------
+    resize();
   })();
   </script>
 </body>
