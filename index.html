@@ -969,24 +969,40 @@
     }
 
     function exportCountsCSV(){
-      const rows = [['poly_id','name','cell_type','total','gene','count']];
+      // Build the complete, sorted gene list
+      const allGenes = (Array.isArray(genes) && genes.length)
+        ? genes.slice()                                // already sorted in loadTranscripts
+        : Array.from(new Set(transcripts.map(p => p.gene))).sort();
+
+      // Header: poly_id, name, cell_type, then one column per gene
+      const header = ['poly_id','name','cell_type'].concat(allGenes);
+      const rows = [header];
+
       for (const p of polygons){
-        const nm = p.name || `ROI ${p.id}`;
+        const nm = (p.name && p.name.trim()) ? p.name.trim() : `ROI ${p.id}`;
         const ct = p.cellType || '';
-        const total = p.total || 0;
-        const entries = Object.entries(p.counts||{}).sort((a,b)=>b[1]-a[1]);
-        if (entries.length === 0){
-          rows.push([p.id, nm, ct, total, '', 0]);
-        } else {
-          for (const [g,c] of entries){
-            rows.push([p.id, nm, ct, total, g, c]);
-          }
+        const counts = p.counts || {};
+        const row = [p.id, nm, ct];
+
+        // Fill counts for every gene (0 if absent)
+        for (const g of allGenes){
+          row.push(counts[g] || 0);
         }
+        rows.push(row);
       }
-      const csv = rows.map(r=>r.join(',')).join('\n');
+
+      // CSV string with basic escaping
+      const csv = rows.map(cells => cells.map(val => {
+        const s = String(val ?? '');
+        return /[",\n]/.test(s) ? `"${s.replace(/"/g,'""')}"` : s;
+      }).join(',')).join('\n');
+
       const blob = new Blob([csv], {type:'text/csv'});
       const url = URL.createObjectURL(blob);
-      const a = document.createElement('a'); a.href = url; a.download = 'polygon_counts.csv'; a.click();
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'annotation_counts.csv';
+      a.click();
       URL.revokeObjectURL(url);
     }
 
