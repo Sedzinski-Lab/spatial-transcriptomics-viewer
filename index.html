@@ -6,7 +6,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   body{margin:0;font-family:system-ui,Segoe UI,Arial;background:#111;color:#eee;display:flex;min-height:100vh}
-  .left{width:380px;background:#1a1a1a;border-right:1px solid #2a2a2a;padding:14px;box-sizing:border-box}
+  .left{width:400px;background:#1a1a1a;border-right:1px solid #2a2a2a;padding:14px;box-sizing:border-box}
   .right{flex:1;position:relative}
   h1{font-size:18px;margin:0 0 10px}
   .box{border:1px solid #2a2a2a;border-radius:8px;padding:10px;margin-bottom:12px;background:#181818}
@@ -20,8 +20,6 @@
   .row>*{flex:1}
   .status{font-size:12px;color:#aaa;margin-top:6px;min-height:16px}
   .overlayInfo{position:absolute;left:8px;top:8px;background:rgba(0,0,0,.55);padding:4px 8px;border-radius:6px;font-size:12px}
-  .overlayControls{position:absolute;right:8px;top:8px;display:flex;gap:8px}
-  .overlayControls button{padding:6px 10px}
   canvas{position:absolute;left:0;top:0}
   .wide { width: 100%; margin-top: 8px; }
 
@@ -47,6 +45,16 @@
 
   /* Mask controls area */
   .maskRow{display:grid;grid-template-columns:auto 1fr auto;gap:6px;align-items:center}
+
+  /* Floating cell-type widget */
+  #cellTypePop{
+    position:absolute; display:none; z-index:50;
+    background:#202020; border:1px solid #333; border-radius:8px;
+    padding:8px; box-shadow:0 10px 30px rgba(0,0,0,.6);
+  }
+  #cellTypePop .row{ display:flex; align-items:center; gap:6px }
+  #cellTypePop input[type=text]{ width:140px }
+  #cellTypePop button{ padding:6px 10px }
 </style>
 </head>
 <body>
@@ -64,6 +72,24 @@
       <input id="trFile" type="file" accept=".txt,.tsv,.csv">
 
       <div class="status" id="status">Pick files to start…</div>
+    </div>
+
+    <div class="box">
+      <label>DAPI contrast (percentile stretch)</label>
+      <div class="maskRow">
+        <span class="muted">Low %</span>
+        <input id="dapiLow" type="range" min="0" max="20" value="2">
+        <span id="dapiLowVal">2%</span>
+      </div>
+      <div class="maskRow">
+        <span class="muted">High %</span>
+        <input id="dapiHigh" type="range" min="80" max="100" value="98">
+        <span id="dapiHighVal">98%</span>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <button id="dapiAutoBtn">Auto 2–98%</button>
+      </div>
+      <div class="muted" style="margin-top:6px">Adjust to reveal nuclei. Works for both TIFF and PNG/JPG.</div>
     </div>
 
     <div class="box">
@@ -119,7 +145,7 @@
       <div class="polys" id="polyList"></div>
       <div class="muted" style="margin-top:6px">
         Click to add vertices. Double-click to finish. Esc to cancel.<br>
-        Click an ROI on the image to select it. Press T to focus cell-type. Delete to remove.
+        Click an ROI on the image to select it. Press T to open cell-type selector. Delete to remove.
       </div>
     </div>
 
@@ -140,9 +166,19 @@
     <canvas id="mask"></canvas>
     <canvas id="points"></canvas>
     <canvas id="poly"></canvas>
+
+    <!-- Floating cell-type selector -->
+    <div id="cellTypePop">
+      <div class="row">
+        <select id="cellTypeSelect"></select>
+        <input id="cellTypeOther" type="text" placeholder="type new…" style="display:none">
+        <button id="cellTypeSave" style="display:none">Save</button>
+        <button id="cellTypeClose" title="Close">×</button>
+      </div>
+    </div>
   </div>
 
-  <!-- GeoTIFF decoder (for robust TIFF reading) -->
+  <!-- GeoTIFF decoder -->
   <script src="https://cdn.jsdelivr.net/npm/geotiff@2.1.3/dist-browser/geotiff.min.js"></script>
 
   <script>
@@ -159,8 +195,16 @@
     const container = document.querySelector('.right');
     const info = document.getElementById('info');
 
-    // Data
-    let dapiImg = null;        // HTMLImageElement for background
+    // Files UI
+    const statusEl = document.getElementById('status');
+
+    // Data: DAPI
+    let dapiW = 0, dapiH = 0;
+    let dapiRaw = null;     // { w,h, gray: Float32Array(0..1), sorted: Float32Array(0..1) }
+    let dapiBitmap = null;  // ImageBitmap for fast draw
+    let dapiLowPct = 2, dapiHighPct = 98;
+
+    // Data: transcripts / layers
     let transcripts = [];      // {x,y,z,gene,score}
     let genes = [];            // gene list
     // gene -> {data,color,size,opacity,visible}
@@ -195,7 +239,7 @@
     let rotStartAngle = 0;     // angle at start of drag
     let rotRefTheta = 0;       // angle from pivot to initial mouse world point
 
-    function setStatus(t){ document.getElementById('status').textContent = t; }
+    function setStatus(t){ statusEl.textContent = t; }
 
     // ---------- Resize ----------
     function resize(){
@@ -207,6 +251,36 @@
     }
     window.addEventListener('resize', resize);
 
+    // ---------- DAPI contrast UI ----------
+    const dapiLowEl  = document.getElementById('dapiLow');
+    const dapiHighEl = document.getElementById('dapiHigh');
+    const dapiLowValEl  = document.getElementById('dapiLowVal');
+    const dapiHighValEl = document.getElementById('dapiHighVal');
+    const dapiAutoBtn = document.getElementById('dapiAutoBtn');
+
+    dapiLowEl.addEventListener('input', ()=>{
+      let v = +dapiLowEl.value;
+      if (v >= dapiHighPct-1) v = dapiHighPct-1;
+      dapiLowPct = Math.max(0, v);
+      dapiLowEl.value = String(dapiLowPct);
+      dapiLowValEl.textContent = dapiLowPct + '%';
+      rebuildDapiBitmap(); redraw();
+    });
+    dapiHighEl.addEventListener('input', ()=>{
+      let v = +dapiHighEl.value;
+      if (v <= dapiLowPct+1) v = dapiLowPct+1;
+      dapiHighPct = Math.min(100, v);
+      dapiHighEl.value = String(dapiHighPct);
+      dapiHighValEl.textContent = dapiHighPct + '%';
+      rebuildDapiBitmap(); redraw();
+    });
+    dapiAutoBtn.addEventListener('click', ()=>{
+      dapiLowPct = 2; dapiHighPct = 98;
+      dapiLowEl.value = '2'; dapiHighEl.value='98';
+      dapiLowValEl.textContent='2%'; dapiHighValEl.textContent='98%';
+      rebuildDapiBitmap(); redraw();
+    });
+
     // ---------- Keyboard ----------
     window.addEventListener('keydown', (e)=>{
       if (e.key === 'Escape' && activePoly){
@@ -217,7 +291,8 @@
         redraw();
       }
       if ((e.key === 't' || e.key === 'T') && selectedPolyId!=null){
-        focusCellTypeSelector(selectedPolyId);
+        const poly = polygons.find(p=>p.id===selectedPolyId);
+        if (poly) openCellTypeUI(poly);
       }
       if ((e.key === 'Delete' || e.key === 'Backspace') && selectedPolyId!=null){
         deleteSelectedPoly();
@@ -264,7 +339,7 @@
       if (!g) return;
       if (layers.has(g)) { setStatus(g+' already added'); return; }
       const pts = transcripts.filter(r=>r.gene===g);
-      const col = randColor();
+      const col = randColorHex();
       const layer = {
         color: col,
         size: defaultSize,
@@ -401,7 +476,7 @@
       zoomAt(cx,cy,k);
     }, {passive:false});
 
-    // finish drawing on double-click; or if not drawing, double-click ROI to focus its selector
+    // finish drawing on double-click; or if not drawing, open cell-type on ROI
     polyCanvas.addEventListener('dblclick', (e)=>{
       if (drawMode && activePoly && activePoly.verts.length>=3){
         polygons.push(activePoly);
@@ -420,7 +495,7 @@
         if (hit){
           selectedPolyId = hit.id;
           renderPolyList(); redraw();
-          focusCellTypeSelector(selectedPolyId);
+          openCellTypeUI(hit);
         }
       }
     });
@@ -431,7 +506,6 @@
       redraw();
     });
 
-
     function handleClickSelect(x,y){
       const imgPt = screenToWorld(x,y);
       const hit = hitTestPolygons(imgPt.x, imgPt.y);
@@ -439,10 +513,14 @@
         selectedPolyId = hit.id;
         renderPolyList(true);
         redraw();
-      } else if (selectedPolyId!=null){
-        selectedPolyId = null;
-        renderPolyList();
-        redraw();
+        openCellTypeUI(hit);
+      } else {
+        closeCellTypeUI();
+        if (selectedPolyId!=null){
+          selectedPolyId = null;
+          renderPolyList();
+          redraw();
+        }
       }
     }
 
@@ -463,6 +541,8 @@
         document.getElementById('completeBtn').disabled = true;
         document.getElementById('cancelBtn').disabled = true;
         redraw();
+      } else {
+        closeCellTypeUI();
       }
     });
     document.getElementById('completeBtn').addEventListener('click', ()=>{
@@ -488,6 +568,89 @@
     document.getElementById('exportJsonBtn').addEventListener('click', exportPolysJSON);
     document.getElementById('exportCsvBtn').addEventListener('click', exportCountsCSV);
 
+    // ---------- Floating cell-type UI ----------
+    const pop = document.getElementById('cellTypePop');
+    const cellTypeSelect = document.getElementById('cellTypeSelect');
+    const cellTypeOther  = document.getElementById('cellTypeOther');
+    const cellTypeSave   = document.getElementById('cellTypeSave');
+    const cellTypeClose  = document.getElementById('cellTypeClose');
+    let cellTypeUI = { visible:false, polyId:null };
+
+    function buildCellTypeOptions(current){
+      const list = [...new Set([current || '', ...cellTypes])]; // include current if custom
+      return list.map(ct=>{
+        const value = (ct === 'Other…') ? '__other__' : ct;
+        const label = ct === '' ? '(unset)' : ct;
+        const sel = ((current || '') === ct) ? ' selected' : '';
+        return '<option value="'+value+'"'+sel+'>'+label+'</option>';
+      }).join('');
+    }
+    function polyCentroid(poly){
+      let x=0, y=0; const n = Math.max(1, poly.verts.length);
+      for (const v of poly.verts){ x+=v.x; y+=v.y; }
+      return { x:x/n, y:y/n };
+    }
+    function positionCellTypeUI(poly){
+      const c = polyCentroid(poly);
+      const sc = worldToScreen(c.x, c.y);
+      pop.style.left = Math.round(sc.x + 8) + 'px';
+      pop.style.top  = Math.round(sc.y - 8) + 'px';
+    }
+    function openCellTypeUI(poly){
+      selectedPolyId = poly.id;
+      cellTypeSelect.innerHTML = buildCellTypeOptions(poly.cellType || '');
+      cellTypeOther.style.display = 'none';
+      cellTypeSave.style.display  = 'none';
+      positionCellTypeUI(poly);
+      pop.style.display = 'block';
+      cellTypeUI = { visible:true, polyId: poly.id };
+      cellTypeSelect.focus();
+    }
+    function closeCellTypeUI(){
+      pop.style.display = 'none';
+      cellTypeUI = { visible:false, polyId:null };
+    }
+
+    cellTypeSelect.onchange = function(){
+      const v = this.value;
+      const poly = polygons.find(p=>p.id === cellTypeUI.polyId);
+      if (!poly) return;
+      if (v === '__other__'){
+        cellTypeOther.style.display = 'inline-block';
+        cellTypeSave.style.display  = 'inline-block';
+        cellTypeOther.value = '';
+        cellTypeOther.focus();
+      } else {
+        poly.cellType = v;
+        renderPolyList(); redraw();
+      }
+    };
+    cellTypeSave.onclick = function(){
+      const name = cellTypeOther.value.trim();
+      if (!name) return;
+      if (!cellTypes.includes(name)){
+        const i = Math.max(0, cellTypes.indexOf('Other…'));
+        cellTypes.splice(i, 0, name); // insert before Other…
+      }
+      const poly = polygons.find(p=>p.id === cellTypeUI.polyId);
+      if (!poly) return;
+      poly.cellType = name;
+      renderPolyList(); redraw();
+      closeCellTypeUI();
+    };
+    cellTypeClose.onclick = closeCellTypeUI;
+
+    // Close on Esc if open (in addition to drawing Esc handler)
+    window.addEventListener('keydown', (e)=>{
+      if (e.key === 'Escape' && cellTypeUI.visible){ closeCellTypeUI(); }
+    });
+    // Click outside popup closes it (but allow clicks on poly canvas)
+    document.addEventListener('mousedown', (e)=>{
+      if (cellTypeUI.visible && !pop.contains(e.target) && e.target !== polyCanvas){
+        closeCellTypeUI();
+      }
+    });
+
     // ---------- Rendering ----------
     function redraw(){
       // clear all
@@ -498,9 +661,9 @@
       xctx.clearRect(0,0,polyCanvas.width,polyCanvas.height);
 
       // DAPI
-      if (dapiImg){
+      if (dapiBitmap){
         applyView(dctx);
-        dctx.drawImage(dapiImg, 0, 0);
+        dctx.drawImage(dapiBitmap, 0, 0);
         dctx.setTransform(1,0,0,1,0,0);
       }
 
@@ -550,6 +713,12 @@
       }
       xctx.setTransform(1,0,0,1,0,0);
 
+      // keep floating cell-type UI positioned
+      if (cellTypeUI.visible){
+        const poly = polygons.find(p=>p.id === cellTypeUI.polyId);
+        if (poly) positionCellTypeUI(poly); else closeCellTypeUI();
+      }
+
       const selText = selectedPolyId!=null ? ` · ROI ${selectedPolyId} selected` : '';
       const deg = (angle*180/Math.PI).toFixed(1);
       info.textContent = `${[...layers.values()].filter(L=>L.visible).length} visible layer(s) · scale ${scale.toFixed(2)} · angle ${deg}°${selText}`;
@@ -566,32 +735,24 @@
     }
 
     function worldToScreen(wx, wy){
-      // For zoomAt helper
       let x = wx, y = wy;
-      // translate -pivot
       x -= pivot.x; y -= pivot.y;
-      // rotate
       const ca = Math.cos(angle), sa = Math.sin(angle);
       const xr =  ca*x - sa*y;
       const yr =  sa*x + ca*y;
-      // translate +pivot
       x = xr + pivot.x; y = yr + pivot.y;
-      // scale and offset
       const sx = offX + x*scale;
       const sy = offY + y*scale;
       return { x: sx, y: sy };
     }
 
     function screenToWorld(sx,sy){
-      // Inverse of T(off) * S(scale) * T(piv) * R(angle) * T(-piv)
-      let x = sx - offX, y = sy - offY; // remove offset
-      x /= scale; y /= scale;           // undo scale
-      x -= pivot.x; y -= pivot.y;       // undo +pivot
-      // undo rotation
+      let x = sx - offX, y = sy - offY;
+      x /= scale; y /= scale;
+      x -= pivot.x; y -= pivot.y;
       const ca = Math.cos(-angle), sa = Math.sin(-angle);
       const xr = ca*x - sa*y;
       const yr = sa*x + ca*y;
-      // undo -pivot
       x = xr + pivot.x; y = yr + pivot.y;
       return { x, y };
     }
@@ -648,16 +809,10 @@
       const worldBefore = screenToWorld(cx,cy);
       const ns = Math.max(0.1, Math.min(20, scale*k));
       scale = ns;
-      // adjust offset so worldBefore stays under cursor
       const screenAfter = worldToScreen(worldBefore.x, worldBefore.y);
       offX += (cx - screenAfter.x);
       offY += (cy - screenAfter.y);
       redraw();
-    }
-
-    function randColor(){
-      const h = Math.floor(Math.random()*360);
-      return `hsl(${h} 90% 60%)`;
     }
 
     // ---------- Counts over ALL transcripts ----------
@@ -682,18 +837,6 @@
       renderPolyList();
     }
 
-    function focusCellTypeSelector(polyId){
-      const box = document.getElementById('polyList');
-      const row = box ? box.querySelector(`.polyItem[data-id="${polyId}"]`) : null;
-      if (row){
-        const sel = row.querySelector('.cellTypeSel');
-        if (sel){
-          row.scrollIntoView({ block:'nearest' });
-          sel.focus();
-        }
-      }
-    }
-
     function renderPolyList(scrollToSelected=false){
       const box = document.getElementById('polyList');
       box.innerHTML = '';
@@ -703,8 +846,6 @@
         div.className='polyItem';
         div.dataset.id = String(poly.id);
         if (poly.id === selectedPolyId) div.classList.add('selected');
-
-        const ctInfo = poly.cellType ? ` · <span class="muted">type: ${poly.cellType}</span>` : '';
 
         div.innerHTML = `
           <div class="polyHead">
@@ -720,8 +861,6 @@
             <select class="cellTypeSel"></select>
             <span class="muted">${poly.verts.length}v · <b>${total}</b> tx</span>
           </div>
-
-          <div class="muted">${ctInfo}</div>
 
           <div class="countsGrid" style="display:grid;grid-template-columns:1fr auto;gap:4px;margin-top:6px;font-size:12px"></div>
         `;
@@ -813,7 +952,7 @@
 
     function exportPolysJSON(){
       const payload = {
-        image: dapiImg ? { width: dapiImg.width, height: dapiImg.height } : null,
+        image: (dapiW && dapiH) ? { width: dapiW, height: dapiH } : null,
         polygons: polygons.map(p=>({
           id: p.id,
           name: p.name,
@@ -894,9 +1033,26 @@
           setStatus('Loading image…');
           const url = URL.createObjectURL(file);
           const img = new Image();
-          img.onload = ()=>{
+          img.onload = async ()=>{
             URL.revokeObjectURL(url);
-            dapiImg=img; fitView(true); redraw(); setStatus(`DAPI ${img.width}×${img.height}`);
+            // Convert to grayscale float [0..1]
+            const w = img.width, h = img.height;
+            const tmp = document.createElement('canvas'); tmp.width=w; tmp.height=h;
+            const tctx = tmp.getContext('2d', { willReadFrequently:true });
+            tctx.drawImage(img, 0, 0);
+            const id = tctx.getImageData(0,0,w,h).data;
+            const gray = new Float32Array(w*h);
+            for (let i=0,j=0;j<w*h;i+=4,j++){
+              const r=id[i], g=id[i+1], b=id[i+2];
+              gray[j] = (0.299*r + 0.587*g + 0.114*b) / 255;
+            }
+            const sorted = Float32Array.from(gray).sort();
+            dapiRaw = { w, h, gray, sorted };
+            dapiW=w; dapiH=h;
+            await rebuildDapiBitmap();
+            fitView(true);
+            redraw();
+            setStatus(`DAPI ${w}×${h} (PNG/JPG, adjustable contrast)`);
           };
           img.onerror = ()=>{ URL.revokeObjectURL(url); setStatus('Could not load image'); };
           img.src = url;
@@ -933,43 +1089,55 @@
         if (samples.length === 3) {
           for (let i=0,j=0; j<px; j++, i+=3) {
             const r = raster[i], g = raster[i+1], b = raster[i+2];
-            grayF[j] = 0.299*r + 0.587*g + 0.114*b;
+            grayF[j] = (0.299*r + 0.587*g + 0.114*b);
           }
+          // normalize to 0..1
+          let min=Infinity, max=-Infinity;
+          for (let j=0;j<px;j++){ const v=grayF[j]; if (v<min) min=v; if (v>max) max=v; }
+          const denom = Math.max(1e-12, max-min);
+          for (let j=0;j<px;j++){ grayF[j] = (grayF[j]-min)/denom; }
         } else {
-          for (let j=0; j<px; j++) grayF[j] = raster[j];
+          // convert to 0..1 using min/max
+          let min=Infinity, max=-Infinity;
+          for (let j=0;j<px;j++){ const v=raster[j]; if (v<min) min=v; if (v>max) max=v; }
+          const denom = Math.max(1e-12, max-min);
+          for (let j=0;j<px;j++){ grayF[j] = (raster[j]-min)/denom; }
         }
 
-        // Percentile stretch (2–98%)
-        const sorted = Array.from(grayF).sort((a,b)=>a-b);
-        const lo = sorted[Math.floor(sorted.length*0.02)];
-        const hi = sorted[Math.floor(sorted.length*0.98)];
-        const denom = Math.max(1e-6, hi - lo);
-
-        const u8 = new Uint8ClampedArray(px);
-        for (let j=0; j<px; j++){
-          let v = (grayF[j] - lo) * 255 / denom;
-          if (v < 0) v = 0; else if (v > 255) v = 255;
-          u8[j] = v|0;
-        }
-
-        const tmp = document.createElement('canvas'); tmp.width = w; tmp.height = h;
-        const tctx = tmp.getContext('2d', { willReadFrequently:true });
-        const imgData = tctx.createImageData(w, h);
-        for (let i=0, j=0; j<px; j++, i+=4){
-          const v = u8[j];
-          imgData.data[i] = v; imgData.data[i+1] = v; imgData.data[i+2] = v; imgData.data[i+3] = 255;
-        }
-        tctx.putImageData(imgData, 0, 0);
-
-        const img = new Image();
-        img.onload = ()=>{ dapiImg = img; fitView(true); redraw(); setStatus(`DAPI ${w}×${h} (GeoTIFF, stretched 2–98%)`); };
-        img.onerror = ()=> setStatus('Could not build image from TIFF');
-        img.src = tmp.toDataURL();
+        const sorted = Float32Array.from(grayF).sort();
+        dapiRaw = { w, h, gray: grayF, sorted };
+        dapiW=w; dapiH=h;
+        await rebuildDapiBitmap();
+        fitView(true);
+        redraw();
+        setStatus(`DAPI ${w}×${h} (TIFF, adjustable contrast)`);
 
       }catch(err){
         console.error(err);
         setStatus('Failed to load DAPI: '+(err?.message||err));
       }
+    }
+
+    async function rebuildDapiBitmap(){
+      if (!dapiRaw) return;
+      const { w,h,gray,sorted } = dapiRaw;
+      const loIdx = Math.floor(sorted.length * (dapiLowPct/100));
+      const hiIdx = Math.floor(sorted.length * (dapiHighPct/100));
+      const lo = sorted[Math.max(0, Math.min(sorted.length-1, loIdx))];
+      const hi = sorted[Math.max(0, Math.min(sorted.length-1, hiIdx))];
+      const denom = Math.max(1e-9, hi - lo);
+
+      const tmp = document.createElement('canvas'); tmp.width=w; tmp.height=h;
+      const tctx = tmp.getContext('2d', { willReadFrequently:true });
+      const imgData = tctx.createImageData(w,h);
+      for (let j=0,i=0;j<w*h;j++,i+=4){
+        let v = (gray[j] - lo) / denom;
+        if (v < 0) v = 0; else if (v > 1) v = 1;
+        const u = (v*255)|0;
+        imgData.data[i] = u; imgData.data[i+1] = u; imgData.data[i+2] = u; imgData.data[i+3] = 255;
+      }
+      tctx.putImageData(imgData,0,0);
+      dapiBitmap = await createImageBitmap(tmp);
     }
 
     // ---------- Load Segmentation Mask (TIFF/PNG) ----------
@@ -1040,7 +1208,7 @@
           showFill: maskShowFillEl.checked,
           showEdges: maskShowEdgesEl.checked
         };
-        if (!dapiImg) setPivotToImageCenter();
+        if (!dapiBitmap) setPivotToImageCenter();
         setStatus(`Mask loaded ${w}×${h}`);
         redraw();
       } catch(err){
@@ -1056,7 +1224,7 @@
       let next = 1;
       for (let j=0,k=0;j<N;j++,k+=3){
         const key = (rgb[k]<<16) | (rgb[k+1]<<8) | (rgb[k+2]);
-        if (key === 0){ labels[j]=0; continue; } // treat black as background
+        if (key === 0){ labels[j]=0; continue; } // black as background
         let lab = map.get(key);
         if (!lab){ lab = next++; map.set(key, lab); }
         labels[j] = lab;
@@ -1084,7 +1252,7 @@
       g1.putImageData(id1,0,0);
       const fillBitmap = await createImageBitmap(c1);
 
-      // Edge bitmap (simple 4-neighbor boundary)
+      // Edge bitmap
       const c2 = document.createElement('canvas'); c2.width=w; c2.height=h;
       const g2 = c2.getContext('2d', { willReadFrequently:true });
       const id2 = g2.createImageData(w,h);
@@ -1110,6 +1278,59 @@
       return { fillBitmap, edgeBitmap };
     }
 
+    // ---------- Fit / Reset ----------
+    function ensureCanvasSize(){
+      const r = container.getBoundingClientRect();
+      [dapiCanvas, maskCanvas, ptsCanvas, polyCanvas].forEach(c=>{
+        if (c.width !== r.width || c.height !== r.height){
+          c.width  = r.width;
+          c.height = r.height;
+          c.style.width  = r.width+'px';
+          c.style.height = r.height+'px';
+        }
+      });
+    }
+    function fitView(resetAngle=false){
+      ensureCanvasSize();
+      if (!(dapiW && dapiH)){
+        scale = 1; offX = 0; offY = 0;
+        if (resetAngle) angle = 0;
+        if (mask){ pivot.x = mask.w/2; pivot.y = mask.h/2; }
+        return;
+      }
+      if (resetAngle) angle = 0;
+
+      const cw = dapiCanvas.width, ch = dapiCanvas.height;
+      const iw = dapiW, ih = dapiH;
+
+      const sx = cw / iw, sy = ch / ih;
+      scale = Math.min(sx, sy) * 0.95;
+
+      const drawW = iw * scale, drawH = ih * scale;
+      offX = Math.round((cw - drawW)/2);
+      offY = Math.round((ch - drawH)/2);
+
+      pivot.x = iw/2;
+      pivot.y = ih/2;
+    }
+
+    function setPivotToImageCenter(){
+      if (dapiW && dapiH){
+        pivot.x = dapiW  / 2;
+        pivot.y = dapiH / 2;
+      } else if (mask){
+        pivot.x = mask.w / 2;
+        pivot.y = mask.h / 2;
+      } else {
+        const wx0 = (-offX) / scale, wy0 = (-offY) / scale;
+        const wx1 = (polyCanvas.width  - offX) / scale;
+        const wy1 = (polyCanvas.height - offY) / scale;
+        pivot.x = (wx0 + wx1) / 2;
+        pivot.y = (wy0 + wy1) / 2;
+      }
+    }
+
+    // ---------- Color helpers ----------
     function hslToRgb(h, s, l){
       if (s===0) { const v = Math.round(l*255); return [v,v,v]; }
       const q = l < 0.5 ? l*(1+s) : l + s - l*s;
@@ -1126,71 +1347,11 @@
       if (t<2/3) return p + (q-p)*(2/3 - t)*6;
       return p;
     }
-
-    // ---------- Fit / Reset ----------
-    function ensureCanvasSize(){
-      // Make sure canvases actually match the visible container size
-      const r = container.getBoundingClientRect();
-      [dapiCanvas, maskCanvas, ptsCanvas, polyCanvas].forEach(c=>{
-        if (c.width !== r.width || c.height !== r.height){
-          c.width  = r.width;
-          c.height = r.height;
-          c.style.width  = r.width+'px';
-          c.style.height = r.height+'px';
-        }
-      });
-    }
-    function fitView(resetAngle=false){
-      // Ensure we have current canvas dimensions
-      ensureCanvasSize();
-
-      // If no image yet, just zero the transform we control
-      if (!dapiImg){
-        scale = 1; offX = 0; offY = 0;
-        if (resetAngle) angle = 0;
-        // If a mask exists, still define a sensible pivot (its center)
-        if (mask){
-          pivot.x = mask.w/2; pivot.y = mask.h/2;
-        }
-        return;
-      }
-
-      // Fit the (unrotated) image into the canvas
-      const cw = dapiCanvas.width, ch = dapiCanvas.height;
-      const iw = dapiImg.width,    ih = dapiImg.height;
-
-      // Reset angle first so math is consistent
-      if (resetAngle) angle = 0;
-
-      const sx = cw / iw, sy = ch / ih;
-      scale = Math.min(sx, sy) * 0.95;
-
-      const drawW = iw * scale, drawH = ih * scale;
-      offX = Math.round((cw - drawW)/2);
-      offY = Math.round((ch - drawH)/2);
-
-      // Always rotate around the image center
-      pivot.x = iw/2;
-      pivot.y = ih/2;
-
-      // (Optional) quick trace for debugging
-      console.log(`[Reset] cw×ch=${cw}×${ch} | img=${iw}×${ih} | scale=${scale.toFixed(3)} | off=(${offX},${offY}) | angle=${(angle*180/Math.PI).toFixed(1)}°`);
-    }
-
-    function setPivotToImageCenter(){
-      if (dapiImg){
-        pivot.x = dapiImg.width  / 2;
-        pivot.y = dapiImg.height / 2;
-      } else if (mask){
-        pivot.x = mask.w / 2;
-        pivot.y = mask.h / 2;
-      } else {
-        const wx0 = (-offX) / scale, wy0 = (-offY) / scale;
-        const wx1 = (polyCanvas.width  - offX) / scale;
-        const wy1 = (polyCanvas.height - offY) / scale;
-        pivot.x = (wx0 + wx1) / 2;
-        pivot.y = (wy0 + wy1) / 2;
-      }
+    function randColorHex(){
+      const h = Math.floor(Math.random()*360);
+      const [r,g,b] = hslToRgb(h/360, 0.9, 0.6);
+      const toHex = v => v.toString(16).padStart(2,'0');
+      return '#' + toHex(r) + toHex(g) + toHex(b);
     }
 
     // ---------- Init ----------
